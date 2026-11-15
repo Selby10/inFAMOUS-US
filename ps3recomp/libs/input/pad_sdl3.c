@@ -30,6 +30,7 @@
 
 #include "cellPad.h"
 #include "pad_sdl3.h"
+#include "pad_host.h"
 
 /* Defined here and, for builds without this file, by the title (selectany: whichever is linked wins). */
 __declspec(selectany) volatile uint32_t g_pad_lightbar_rgb = 0;
@@ -37,7 +38,7 @@ __declspec(selectany) volatile uint32_t g_pad_lightbar_rgb = 0;
 #define SDLFN(X) X(SDL_Init) X(SDL_SetHint) X(SDL_GetError) X(SDL_free) X(SDL_GetGamepads) X(SDL_OpenGamepad) \
     X(SDL_CloseGamepad) X(SDL_GamepadConnected) X(SDL_GetGamepadID) X(SDL_GetGamepadType) X(SDL_GetGamepadName) \
     X(SDL_GetGamepadButton) X(SDL_GetGamepadAxis) X(SDL_UpdateGamepads) X(SDL_RumbleGamepad) X(SDL_SetGamepadLED) \
-    X(SDL_SetGamepadPlayerIndex) X(SDL_GetGamepadConnectionState) X(SDL_GetGamepadTypeForID)
+    X(SDL_GamepadHasSensor) X(SDL_SetGamepadSensorEnabled) X(SDL_GetGamepadSensorData) X(SDL_SetGamepadPlayerIndex) X(SDL_GetGamepadConnectionState) X(SDL_GetGamepadTypeForID)
 #define SDL_DECL(n) static __typeof__(n)* p_##n;
 SDLFN(SDL_DECL)
 
@@ -49,6 +50,8 @@ typedef struct {
     uint16_t rumble_sent;        /* small << 8 | large last sent */
     unsigned long long rumble_at;
     uint32_t led_sent;
+    int accel, gyro;
+    SDL_SensorType accel_type, gyro_type;
 } OpenPad;
 
 static int s_state = 0;                  /* 0 not started, 1 running, -1 off / failed */
@@ -215,10 +218,9 @@ static void close_pad(int i)
     const char* n = p_SDL_GetGamepadName(s_open[i].gp);
     printf("[cellPad] SDL3: %s disconnected\n", n ? n : "gamepad"); fflush(stdout);
     p_SDL_CloseGamepad(s_open[i].gp);
-    memmove(&s_open[i], &s_open[i + 1], sizeof(OpenPad) * (size_t)(s_nopen - i - 1));
+    memset(&s_open[i], 0, sizeof s_open[i]);
+    InterlockedExchange(&s_rumble_req[i], 0);
     s_nopen--;
-    for (int k = i; k < MAXPADS - 1; k++) InterlockedExchange(&s_rumble_req[k], s_rumble_req[k + 1]);
-    InterlockedExchange(&s_rumble_req[MAXPADS - 1], 0);
 }
 
 static void rescan(void)
@@ -228,16 +230,31 @@ static void rescan(void)
     if (!ids) return;
     for (int k = 0; k < n && s_nopen < MAXPADS; k++) {
         int open = 0;
-        for (int i = 0; i < s_nopen; i++) if (s_open[i].id == ids[k]) open = 1;
+        for (int i = 0; i < MAXPADS; i++) if (s_open[i].gp && s_open[i].id == ids[k]) open = 1;
         if (open) continue;
         const SDL_GamepadType t = p_SDL_GetGamepadTypeForID(ids[k]);
         if (t == SDL_GAMEPAD_TYPE_XBOX360 || t == SDL_GAMEPAD_TYPE_XBOXONE) continue;   /* XInput has those */
         SDL_Gamepad* g = p_SDL_OpenGamepad(ids[k]);
         if (!g) continue;
-        OpenPad* o = &s_open[s_nopen++];
+        int slot = 0;
+        while (slot < MAXPADS && s_open[slot].gp) slot++;
+        OpenPad* o = &s_open[slot];
+        s_nopen++;
         memset(o, 0, sizeof *o);
         o->gp = g; o->id = ids[k];
-        p_SDL_SetGamepadPlayerIndex(g, s_nopen - 1);
+        p_SDL_SetGamepadPlayerIndex(g, slot);
+        /* A paired Joy-Con may expose left/right sensors instead of a generic one. */
+        const SDL_SensorType accel_types[] = {SDL_SENSOR_ACCEL, SDL_SENSOR_ACCEL_L, SDL_SENSOR_ACCEL_R};
+        const SDL_SensorType gyro_types[] = {SDL_SENSOR_GYRO, SDL_SENSOR_GYRO_L, SDL_SENSOR_GYRO_R};
+        for (int t=0; t<3; t++) {
+            if (!o->accel && p_SDL_GamepadHasSensor(g, accel_types[t]) && p_SDL_SetGamepadSensorEnabled(g, accel_types[t], true)) {
+                o->accel=1; o->accel_type=accel_types[t];
+            }
+            if (!o->gyro && p_SDL_GamepadHasSensor(g, gyro_types[t]) && p_SDL_SetGamepadSensorEnabled(g, gyro_types[t], true)) {
+                o->gyro=1; o->gyro_type=gyro_types[t];
+            }
+        }
+        printf("[cellPad] SDL3 motion: accel %s, gyro %s\n", o->accel ? "on" : "unavailable", o->gyro ? "on" : "unavailable");
         const SDL_JoystickConnectionState c = p_SDL_GetGamepadConnectionState(g);
         const char* name = p_SDL_GetGamepadName(g);
         printf("[cellPad] SDL3: %s (%s, %s) connected\n", name ? name : "gamepad", type_name(p_SDL_GetGamepadType(g)),
@@ -255,17 +272,25 @@ void pad_sdl3_update(void)
         s_state = start() ? 1 : -1;
     }
     if (s_state < 0) return;
+    EnterCriticalSection(&s_lock);
     p_SDL_UpdateGamepads();
     const unsigned long long now = GetTickCount64();
-    for (int i = s_nopen - 1; i >= 0; i--) if (!p_SDL_GamepadConnected(s_open[i].gp)) close_pad(i);
+    for (int i = MAXPADS - 1; i >= 0; i--) if (s_open[i].gp && !p_SDL_GamepadConnected(s_open[i].gp)) close_pad(i);
     if (now >= next_scan) { next_scan = now + 500; rescan(); }
 
     PadSdlPad snap[MAXPADS];
     memset(snap, 0, sizeof snap);
     const uint32_t led = g_pad_lightbar_rgb;
-    for (int i = 0; i < s_nopen; i++) {
+    for (int i = 0; i < MAXPADS; i++) {
         OpenPad* o = &s_open[i];
+        if (!o->gp) continue;
         read_pad(o->gp, &snap[i]);
+        snap[i].id = o->id;
+        snap[i].motion = o->accel || o->gyro;
+        float accel[3], gyro[3];
+        const int have_accel = o->accel && p_SDL_GetGamepadSensorData(o->gp, o->accel_type, accel, 3);
+        const int have_gyro = o->gyro && p_SDL_GetGamepadSensorData(o->gp, o->gyro_type, gyro, 3);
+        pad_host_motion(snap[i].sensors, have_accel ? accel : NULL, have_gyro ? gyro : NULL);
         snap[i].type = pad_type_of(p_SDL_GetGamepadType(o->gp));
         /* PS3 motors hold their setting until the next SetActDirect; SDL rumble runs for a duration -> refresh it */
         const uint16_t r = s_rumble ? (uint16_t)s_rumble_req[i] : 0;
@@ -278,9 +303,22 @@ void pad_sdl3_update(void)
             o->led_sent = led;
         }
     }
-    EnterCriticalSection(&s_lock);
     memcpy(s_snap, snap, sizeof snap);
-    s_nsnap = s_nopen;
+    s_nsnap = MAXPADS;
+    LeaveCriticalSection(&s_lock);
+}
+
+void pad_sdl3_stop_rumble(void)
+{
+    if (s_state <= 0) return;
+    EnterCriticalSection(&s_lock);
+    for (int i=0; i<MAXPADS; i++) {
+        InterlockedExchange(&s_rumble_req[i], 0);
+        if (s_open[i].gp) p_SDL_RumbleGamepad(s_open[i].gp, 0, 0, 0);
+        if (s_open[i].gp) close_pad(i);
+    }
+    memset(s_snap, 0, sizeof s_snap);
+    s_nsnap=0;
     LeaveCriticalSection(&s_lock);
 }
 
@@ -294,11 +332,15 @@ int pad_sdl3_get(PadSdlPad* out, int max)
     return n;
 }
 
-void pad_sdl3_rumble(int index, uint8_t small_motor, uint8_t large_motor)
+void pad_sdl3_rumble(uint32_t id, uint8_t small_motor, uint8_t large_motor)
 {
-    if (index < 0 || index >= MAXPADS) return;
-    /* libpad: the small motor is on/off (0 or 1), the large one 0..255 */
-    InterlockedExchange(&s_rumble_req[index], (LONG)((small_motor ? 0xFF00u : 0u) | large_motor));
+    if (s_state <= 0) return;
+    EnterCriticalSection(&s_lock);
+    for (int i=0; i<MAXPADS; i++) if (s_open[i].gp && s_open[i].id == id) {
+        InterlockedExchange(&s_rumble_req[i], (LONG)((small_motor ? 0xFF00u : 0u) | large_motor));
+        break;
+    }
+    LeaveCriticalSection(&s_lock);
 }
 
 #endif   /* PS3RECOMP_SDL3 */

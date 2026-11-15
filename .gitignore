@@ -11,6 +11,11 @@ inFamous.exe
 PS3_GAME/
 *.iso
 *.dkey
+*.rap
+*.rifkey
+*.pkg
+*.edat
+*.edat.dec
 EBOOT.BIN
 EBOOT.elf
 *.psarc
@@ -37,7 +42,10 @@ infamous-recomp/build-*/
 infamous-recomp/out/
 infamous-recomp/pgo/
 infamous-recomp/memdump/
+infamous-recomp/recomp_spu_ls.bin
 infamous-recomp/shadercache/
+infamous-recomp/shadercache-before-*/
+infamous-recomp/shadercache-after-*/
 infamous-recomp/gamedata/
 infamous-recomp/settings.ini
 *.log

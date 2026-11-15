@@ -289,6 +289,7 @@ env = { RD_SPU_INTERP = "1", INFAMOUS_BINK_COMPLETION = "1", PS3_VERBOSE = "0", 
 
 [export]
 exclude = [
+  "**/*.pkg", "**/*.rap", "**/*.rifkey", "**/*.edat", "**/*.edat.dec", "**/*.dkey", "**/*.iso",
   # the game itself, and dumps of its memory
   "Infamous (US)/",
   "Infamous (Europe) (Fr,De,Es,It,Nl)/",
@@ -299,6 +300,7 @@ exclude = [
   "infamous-recomp/tools/fn/",              # single lifted functions pulled out for study
   "infamous-recomp/gamedata/",
   "infamous-recomp/shadercache/",
+  "infamous-recomp/shadercache-before-*/", "infamous-recomp/shadercache-after-*/",
   "infamous-recomp/rsxcap/",
   "infamous-recomp/frames/",
   "infamous-recomp/frags/",
@@ -337,6 +339,7 @@ exclude = [
 ]
 keep = [
   "installer/pgo/infamous.profdata",
+  "installer/pgo/infamous-us.profdata",
   # Published for self-update: mapped to installer/infamous-installer.exe and inFamous.exe.
   "installer/bin/infamous-installer.exe", "installer/bin/infamous-launch.exe",
   # only the build files the tree needs ("**/CMakeLists.txt" also pulled in excluded folders that have one)
@@ -354,6 +357,7 @@ keep = [
 # Files that must never be published or packed into a setup: `export` and `package` stop with an
 # error if the rules above would let any of them through.
 forbid = [
+  "**/*.pkg", "**/*.rap", "**/*.rifkey", "**/*.edat", "**/*.edat.dec", "**/*.dkey", "**/*.iso",
   "**/*skate*", "**/*skate*/**",
   "**/*HANDOFF*", "**/*handoff*", "**/*AGENT*", "**/*agent*",
   "**/*COORD*", "**/*coord*", "**/*THREAD_PERF*", "**/*thread_perf*",
@@ -366,7 +370,7 @@ forbid = [
 # `infamous-installer update` and the setup's "Update now": where new versions come from. The repository
 # is the curated github/ working copy (publish-github.cmd pushes it). Only files whose content differs are downloaded.
 [update]
-repo = "whompay/inFAMOUSreborn"
+repo = "WoofahRayetCode/inFAMOUS-US"
 branch = "main"
 # Folder inside the repository that holds this tree ("" = the repository root).
 path = ""

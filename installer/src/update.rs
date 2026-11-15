@@ -938,6 +938,40 @@ mod tests {
 
 #[cfg(test)]
 mod manifest_tests {
+    #[test]
+    fn export_retains_regional_profiles_but_not_game_or_license_files() {
+        let m = shipped_manifest();
+        let root =
+            std::env::temp_dir().join(format!("infamous-export-policy-{}", std::process::id()));
+        let keep = [
+            "installer/pgo/infamous.profdata",
+            "installer/pgo/infamous-us.profdata",
+        ];
+        let private = [
+            "infamous-recomp/shadercache-before-test/cache.dat",
+            "infamous-recomp/shadercache-after-test/cache.dat",
+            "dlc/test.pkg",
+            "dlc/test.rap",
+            "dlc/test.edat.rifkey",
+            "dlc/test.edat",
+            "dlc/test.edat.dec",
+            "disc/game.dkey",
+            "disc/game.iso",
+            "infamous-recomp/recompiled/game.cpp",
+        ];
+        for path in keep.iter().chain(private.iter()) {
+            crate::util::write_file(&root.join(path), b"test fixture").unwrap();
+        }
+        let files = crate::pipeline::export_files(&m, &root, &[]).unwrap();
+        for path in keep {
+            assert!(files.iter().any(|p| p == path), "missing {path}");
+        }
+        for path in private {
+            assert!(!files.iter().any(|p| p == path), "leaked {path}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn shipped_manifest() -> crate::manifest::Manifest {
         crate::manifest::Manifest::load(std::path::Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -949,7 +983,10 @@ mod manifest_tests {
     #[test]
     fn shipped_manifest_has_update_section() {
         let m = shipped_manifest();
-        assert_eq!(m.update_repo.as_deref(), Some("whompay/inFAMOUSreborn"));
+        assert_eq!(
+            m.update_repo.as_deref(),
+            Some("WoofahRayetCode/inFAMOUS-US")
+        );
         assert_eq!(m.update_branch, "main");
         assert_eq!(m.update_path, "");
         for binary in [
@@ -984,10 +1021,15 @@ mod manifest_tests {
             .iter()
             .any(|arg| arg.starts_with("-DPORT_PGO_PROFILE=")
                 && arg.ends_with("pgo/infamous.profdata")));
-        assert!(
-            crate::util::any_match(&m.export_keep, "installer/pgo/infamous.profdata"),
-            "PGO profile must be published"
-        );
+        for profile in [
+            "installer/pgo/infamous.profdata",
+            "installer/pgo/infamous-us.profdata",
+        ] {
+            assert!(
+                crate::util::any_match(&m.export_keep, profile),
+                "{profile} must be published"
+            );
+        }
     }
 }
 

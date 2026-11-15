@@ -3793,6 +3793,10 @@ extern "C" uint32_t g_sc_inflight[PS3_SC_INFLIGHT_MAX] = { 0 };
 #ifdef _WIN32
 static void telem_cpu_report(double win_ms)
 {
+    const ULONGLONG report_start = GetTickCount64();
+    static ULONGLONG previous_start;
+    if (previous_start && report_start > previous_start) win_ms = (double)(report_start - previous_start);
+    previous_start = report_start;
     typedef LONG (WINAPI *NtQIT)(HANDLE, int, PVOID, ULONG, PULONG);
     static NtQIT q = (NtQIT)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
     enum { NT = 1024 };
@@ -3831,7 +3835,48 @@ static void telem_cpu_report(double win_ms)
     char line[2048]; int o = snprintf(line, sizeof line, "[TELEM-CPU] process %.0f%% of one core; threads >=2%%:", total);
     for (int i = 0; i < nr && o < (int)sizeof line - 48; i++)
         o += snprintf(line + o, sizeof line - o, " %lu:%.0f%%@%llX", (unsigned long)rows[i].id, rows[i].pct, rows[i].rva);
-    fprintf(stderr, "%s\n", line);
+    fprintf(stderr, "%s | host report %llu ms (helper thread)\n", line,
+            (unsigned long long)(GetTickCount64() - report_start));
+}
+
+/* Thread snapshots can take tens of milliseconds on a busy Windows desktop.
+ * Never enumerate host threads in the guest syscall that closes a telemetry
+ * window. One process-lifetime helper owns the report's history; requests are
+ * bounded and dropped while it is busy, with no synchronous fallback. */
+static INIT_ONCE s_telem_cpu_once = INIT_ONCE_STATIC_INIT;
+static HANDLE s_telem_cpu_event;
+static volatile LONG64 s_telem_cpu_window_us;
+static DWORD WINAPI telem_cpu_worker(void*)
+{
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    while (WaitForSingleObject(s_telem_cpu_event, INFINITE) == WAIT_OBJECT_0) {
+        const LONG64 us = InterlockedCompareExchange64(&s_telem_cpu_window_us, 0, 0);
+        if (us > 0) {
+            telem_cpu_report((double)us / 1000.0);
+            InterlockedExchange64(&s_telem_cpu_window_us, 0);
+        }
+    }
+    return 0;
+}
+static BOOL CALLBACK telem_cpu_init(PINIT_ONCE, PVOID, PVOID*)
+{
+    s_telem_cpu_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (!s_telem_cpu_event) return FALSE;
+    HANDLE worker = CreateThread(NULL, 0, telem_cpu_worker, NULL, 0, NULL);
+    if (!worker) {
+        CloseHandle(s_telem_cpu_event);
+        s_telem_cpu_event = NULL;
+        return FALSE;
+    }
+    CloseHandle(worker);
+    return TRUE;
+}
+static void telem_cpu_request(double win_ms)
+{
+    if (win_ms <= 0 || !InitOnceExecuteOnce(&s_telem_cpu_once, telem_cpu_init, NULL, NULL)) return;
+    const LONG64 us = (LONG64)(win_ms * 1000.0);
+    if (us > 0 && InterlockedCompareExchange64(&s_telem_cpu_window_us, us, 0) == 0)
+        SetEvent(s_telem_cpu_event);
 }
 #endif
 
@@ -5071,7 +5116,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                         uint64_t tot[TT]; for (int t = 0; t < TT; t++) { tot[t] = 0; for (int n = 0; n < TS; n++) tot[t] += t_acc[t][n]; }
                         fprintf(stderr, "[TELEM] syscall wait time per guest thread, last %.0f ms:\n", win_ms);
 #ifdef _WIN32
-                        telem_cpu_report(win_ms);
+                        telem_cpu_request(win_ms);
 #endif
                         for (int r = 0; r < 6; r++) {
                             int bt = -1; for (int t = 0; t < TT; t++) if (tot[t] && (bt < 0 || tot[t] > tot[bt])) bt = t;

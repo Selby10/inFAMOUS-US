@@ -95,6 +95,34 @@ Disc images: `infamous-installer extract-iso --iso game.iso --out DIR [--dkey ga
 same extractor on the command line. RPCS3 (`rpcs3 --decrypt`) unlocks EBOOT.BIN; the setup finds
 rpcs3.exe in the usual places or asks for it.
 
+## US Gigawatt Blades DLC
+
+After building the base game, import your US DLC package and matching RAP with
+the installer's Python environment (or another Python with `pycryptodome`):
+
+```bat
+.installer\venv\Scripts\python installer\tools\import_gigawatt.py --pkg "D:\DLC\Gigawatt.pkg" --rap "D:\DLC\UP9000-BCUS98119_00-SMLAUNCHPROMO000.rap" --hdd-root "D:\Games\inFAMOUS-US\HDD"
+```
+
+The helper verifies the content ID and EDAT block authentication before installing
+the sentinel and its private license sidecar. It preserves existing title metadata
+and saves. A mismatched RAP or damaged sentinel fails before installation.
+Keep the original PKG/RAP and the installed HDD tree outside source control.
+
+All launch paths must inherit the same `PS3_HDD0_ROOT`. Use a private wrapper next
+to `Play inFamous.cmd`, including after updates:
+
+```bat
+@echo off
+setlocal
+set "PS3_HDD0_ROOT=D:\Games\inFAMOUS-US\HDD"
+call "%~dp0Play inFamous.cmd"
+```
+
+For diagnostics, call `play-dred.cmd` from the same wrapper instead. If launching
+the graphical `inFamous.exe`, start it from this environment too. Import success
+verifies the file/license pair; verify the power in gameplay and after a restart.
+
 ## For the maintainer
 
 The patch set has to be created once on the development tree, and again whenever the

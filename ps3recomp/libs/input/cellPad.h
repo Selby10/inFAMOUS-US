@@ -206,6 +206,8 @@ s32 cellPadClearBuf(u32 port_no);
 
 /* Internal: call once per frame to update pad state from host input */
 void cellPad_poll(void);
+/* Physical input for host overlays, independent of guest input suppression. PAD_UI_* in pad_host.h. */
+unsigned cellPadGetOverlayInput(void);
 
 /* Optional port-owned filter for a completed host-endian packet.  It runs
  * before pressure values are derived from the final digital button state. */

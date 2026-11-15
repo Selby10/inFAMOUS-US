@@ -1406,21 +1406,25 @@ static HWND create_window(u32 width, u32 height, const char* title)
  * D3D12 initialization
  * -----------------------------------------------------------------------*/
 
-/* D3D12_DRED=1: Device Removed Extended Data. Turned on before the device is
+/* D3D12_DRED=1: Device Removed Extended Data (0 explicitly disables it).
+ * Configured before the device is
  * created; after a device removal d3d12_dred_report() prints which command-list
  * op was the last to complete (counted in draws) and, for a GPU page fault, the
  * faulting VA next to the VAs of our big buffers. Needs no SDK debug layer.
  * Added 2026-10-04 for inFamous' first in-world frame (DEVICE_HUNG). */
 static void d3d12_dred_enable(void)
 {
-    if (!getenv("D3D12_DRED")) return;
+    const char* setting = getenv("D3D12_DRED");
+    if (!setting || !*setting) return; /* Unset preserves the system default. */
+    const int enabled = atoi(setting) != 0;
     ID3D12DeviceRemovedExtendedDataSettings* ds = NULL;
     HRESULT hr = D3D12GetDebugInterface(&IID_ID3D12DeviceRemovedExtendedDataSettings, (void**)&ds);
     if (SUCCEEDED(hr) && ds) {
-        ds->lpVtbl->SetAutoBreadcrumbsEnablement(ds, D3D12_DRED_ENABLEMENT_FORCED_ON);
-        ds->lpVtbl->SetPageFaultEnablement(ds, D3D12_DRED_ENABLEMENT_FORCED_ON);
+        const D3D12_DRED_ENABLEMENT mode = enabled ? D3D12_DRED_ENABLEMENT_FORCED_ON : D3D12_DRED_ENABLEMENT_FORCED_OFF;
+        ds->lpVtbl->SetAutoBreadcrumbsEnablement(ds, mode);
+        ds->lpVtbl->SetPageFaultEnablement(ds, mode);
         ds->lpVtbl->Release(ds);
-        printf("[D3D12] DRED enabled (auto-breadcrumbs + page faults)\n");
+        printf("[D3D12] DRED %s (auto-breadcrumbs + page faults)\n", enabled ? "enabled" : "disabled");
     } else {
         printf("[D3D12] DRED unavailable (0x%08lX)\n", (unsigned long)hr);
     }
@@ -2231,7 +2235,11 @@ static void wait_for_gpu(void)
 
 static void move_to_next_frame(void)
 {
-    u64 current_fence = s_d3d.fence_values[s_d3d.frame_index];
+    /* wait_for_gpu() may have already signaled and completed this slot's
+     * value BEFORE the list we just submitted. Give the submission a fresh
+     * value so an unchanged backbuffer index (offscreen batch/occlusion)
+     * cannot skip its wait and reset an allocator still used by the GPU. */
+    u64 current_fence = ++s_d3d.fence_values[s_d3d.frame_index];
     s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_d3d.fence, current_fence);
 
     s_d3d.frame_index = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
@@ -5668,6 +5676,9 @@ static u32 s_tcj_n[2];
 static volatile LONG64 s_tcj_ctr = 0;            /* gen (bits 40..63) | n (bits 20..39) | next (bits 0..19) */
 static volatile LONG s_tcj_wake = 0;             /* workers sleep on this (WaitOnAddress) */
 static volatile LONG s_tcj_in[2] = { 0, 0 };     /* workers inside an array of that parity */
+/* A worker can be descheduled after reading the wake generation but before
+ * incrementing s_tcj_in. That counter alone cannot exclude buffer reuse. */
+static SRWLOCK s_tcj_lock[2] = { SRWLOCK_INIT, SRWLOCK_INIT };
 static u32 s_pcs_frame[VP_TEX_SLOTS], s_pcs_q[VP_TEX_SLOTS], s_pcs_off[VP_TEX_SLOTS], s_pcs_nb[VP_TEX_SLOTS],
            s_pcs_fs[VP_TEX_SLOTS], s_pcs_val[VP_TEX_SLOTS];
 static u8 s_pcs_dense[VP_TEX_SLOTS];
@@ -5706,9 +5717,11 @@ static DWORD WINAPI tcs_worker(LPVOID p)
         while (g == seen) { WaitOnAddress(&s_tcj_wake, &seen, sizeof(LONG), INFINITE); g = s_tcj_wake; }
         seen = g;
         const u32 gen = (u32)g;
+        AcquireSRWLockShared(&s_tcj_lock[gen & 1u]);
         InterlockedIncrement(&s_tcj_in[gen & 1u]);
         tcs_run(gen, 1);
         InterlockedDecrement(&s_tcj_in[gen & 1u]);
+        ReleaseSRWLockShared(&s_tcj_lock[gen & 1u]);
     }
     return 0;
 }
@@ -5832,6 +5845,10 @@ static u32 tcs_scan_publish(const D3D12DrawRecord* draws, u32 count, u32 g, u32 
 {
     extern uint8_t* vm_base;
     const u32 par = g & 1u;
+    /* Never wait for a straggler on the render thread: use serial checksums
+     * for this frame instead. A late old-generation worker takes the shared
+     * lock afterward and tcs_claim rejects its stale generation. */
+    if (!TryAcquireSRWLockExclusive(&s_tcj_lock[par])) { s_tcs_skip_in++; return 0; }
     TexCsJob* const a = s_tcj[par];
     const int assoc = tex_assoc_on();
     const int nway = assoc ? TEX_ASSOC_WAYS : 1;
@@ -5878,6 +5895,7 @@ static u32 tcs_scan_publish(const D3D12DrawRecord* draws, u32 count, u32 g, u32 
         InterlockedExchange64(&s_tcj_ctr, (LONG64)(((u64)(g & 0xFFFFFFu) << 40) | ((u64)n << 20)));
         if (s_tcs_nthr) { InterlockedExchange(&s_tcj_wake, (LONG)g); WakeByAddressAll((PVOID)&s_tcj_wake); }
     }
+    ReleaseSRWLockExclusive(&s_tcj_lock[par]);
     return n;
 }
 static void tcs_report(unsigned long long dt, u32 n)
@@ -16271,23 +16289,39 @@ static void d3d12_dred_report(void)
         int nodes = 0;
         for (const D3D12_AUTO_BREADCRUMB_NODE* n = bc.pHeadAutoBreadcrumbNode; n && nodes < 8; n = n->pNext, nodes++) {
             UINT32 last = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
+            /* DRED retains only the last 65536 operations in a ring. The
+             * counters are not array indexes, and an unavailable/inconsistent
+             * counter must not be reported as a successfully finished list. */
+            const UINT32 history_begin = n->BreadcrumbCount > 65536u ? n->BreadcrumbCount - 65536u : 0;
+            const int counter_valid = n->pLastBreadcrumbValue && last <= n->BreadcrumbCount;
+            if (!n->pCommandHistory || !counter_valid) {
+                printf("[DRED] cmdlist %p: %u ops, completed counter %u; %s, completion unknown\n",
+                       (void*)n->pCommandList, n->BreadcrumbCount, last,
+                       !n->pCommandHistory ? "history unavailable" :
+                       !n->pLastBreadcrumbValue ? "counter unavailable" : "counter exceeds recorded operations");
+                continue;
+            }
             UINT32 draws_done = 0, draws_total = 0;
-            for (UINT32 i = 0; i < n->BreadcrumbCount; i++) {
-                int op = (int)n->pCommandHistory[i];
+            for (UINT32 i = history_begin; i < n->BreadcrumbCount; i++) {
+                int op = (int)n->pCommandHistory[i % 65536u];
                 if (op == D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED ||
                     op == D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED) {
                     draws_total++;
                     if (i < last) draws_done++;
                 }
             }
-            printf("[DRED] cmdlist %p: %u ops, last completed op index %u -> %u of %u draws completed%s\n",
+            printf("[DRED] cmdlist %p: %u ops, completed counter %u -> %u of %u retained draws completed%s\n",
                    (void*)n->pCommandList, n->BreadcrumbCount, last, draws_done, draws_total,
                    (last < n->BreadcrumbCount) ? "  <== this list did not finish" : "");
             if (last < n->BreadcrumbCount) {
-                UINT32 lo = last > 8 ? last - 8 : 0, hi = last + 4 < n->BreadcrumbCount ? last + 4 : n->BreadcrumbCount;
+                UINT32 lo = last > 8 ? last - 8 : 0;
+                UINT32 hi = n->BreadcrumbCount - last > 4 ? last + 4 : n->BreadcrumbCount;
+                if (lo < history_begin) lo = history_begin;
+                if (last < history_begin)
+                    printf("[DRED] first uncompleted operation is no longer retained\n");
                 for (UINT32 i = lo; i < hi; i++)
-                    printf("[DRED]   op[%u] = %d%s\n", i, (int)n->pCommandHistory[i],
-                           i == last ? "   <== first NOT completed" : "");
+                    printf("[DRED]   op[%u] = %d%s\n", i, (int)n->pCommandHistory[i % 65536u],
+                           i == last ? "   <== first not reported completed" : "");
             }
         }
         if (!nodes) printf("[DRED] no breadcrumb nodes\n");
@@ -16295,7 +16329,7 @@ static void d3d12_dred_report(void)
     D3D12_DRED_PAGE_FAULT_OUTPUT pf = {0};
     if (SUCCEEDED(dred->lpVtbl->GetPageFaultAllocationOutput(dred, &pf))) {
         printf("[DRED] page fault VA = 0x%016llX%s\n", (unsigned long long)pf.PageFaultVA,
-               pf.PageFaultVA ? "" : " (none -- a real hang/timeout, not a bad address)");
+               pf.PageFaultVA ? "" : " (not reported; failure cause is not established)");
         int k = 0;
         for (const D3D12_DRED_ALLOCATION_NODE* a = pf.pHeadExistingAllocationNode; a && k < 8; a = a->pNext, k++)
             printf("[DRED]   existing alloc at fault: type=%d name=%s\n", (int)a->AllocationType,

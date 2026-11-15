@@ -68,6 +68,7 @@ void     ppu_recomp_register(void);           /* generated: lifted table -> addr
 void     ppu_hle_init(void);                  /* firmware import NID -> HLE handler */
 void     ppu_sysprx_register(void);           /* boot-critical CRT (sys_initialize_tls, ...) */
 void     ppu_fs_register(void);               /* cellFs over the real game directory */
+void     cellGame_init_from_paramsfo(const char* path); /* title-specific HDD paths */
 void     lv2_init_syscalls(void);             /* the lv2 syscall table */
 int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
 
@@ -1006,6 +1007,28 @@ int main(int argc, char** argv)
 
     derive_vfs_root(argv[1]);
     printf("[boot] VFS root: %s\n", ppu_vfs_root);
+
+    /* Initialize cellGame before the guest asks for its HDD content directory.
+     * Without this, BootCheck/ContentPermit return the placeholder BLES00000,
+     * so installed DLC under the real title ID is never found. Use the dump's
+     * metadata for both US and European releases, as the toolkit harness does. */
+    {
+        static const char* const layouts[] = {
+            "%s/PS3_GAME/PARAM.SFO", /* disc root */
+            "%s/../PARAM.SFO",      /* USRDIR override */
+            "%s/PARAM.SFO",         /* game directory override */
+        };
+        char sfo[1100];
+        bool found = false;
+        for (const char* layout : layouts) {
+            snprintf(sfo, sizeof sfo, layout, ppu_vfs_root);
+            FILE* f = fopen(sfo, "rb");
+            if (f) { fclose(f); found = true; break; }
+        }
+        if (!found)
+            snprintf(sfo, sizeof sfo, layouts[0], ppu_vfs_root);
+        cellGame_init_from_paramsfo(sfo);
+    }
 
     ppu_recomp_register();   /* lifted function table -> address map */
     ps3_load_prx_modules();  /* this game's lifted system PRX, if it has any */

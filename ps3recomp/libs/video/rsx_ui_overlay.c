@@ -34,7 +34,8 @@ const uiov_trainer_api* volatile g_uiov_trainer = 0;
 #include <d3d12.h>
 #include "rsx_d3d12_abi.h"   /* struct-returning D3D12 calls for every Windows SDK */
 #include <d3dcompiler.h>
-#include <xinput.h>
+#include "../input/cellPad.h"
+#include "../input/pad_host.h"
 #include <math.h>
 #include <limits.h>
 
@@ -190,22 +191,11 @@ int uiov_pad_gate(void)
 }
 
 /* ---------------- input ---------------- */
-enum { IN_OK = 1, IN_BACK = 2, IN_LEFT = 4, IN_RIGHT = 8, IN_TAB = 16, IN_UP = 32, IN_DOWN = 64, IN_SELECT = 128 };
+enum { IN_OK=PAD_UI_OK, IN_BACK=PAD_UI_BACK, IN_LEFT=PAD_UI_LEFT, IN_RIGHT=PAD_UI_RIGHT,
+       IN_TAB=PAD_UI_TAB, IN_UP=PAD_UI_UP, IN_DOWN=PAD_UI_DOWN, IN_SELECT=PAD_UI_SELECT };
 static unsigned read_input(HWND hwnd)
 {
-    unsigned b = 0;
-    for (DWORD i = 0; i < 4; i++) {
-        XINPUT_STATE st; memset(&st, 0, sizeof st);
-        if (XInputGetState(i, &st) != ERROR_SUCCESS) continue;
-        WORD w = st.Gamepad.wButtons;
-        if (w & XINPUT_GAMEPAD_A) b |= IN_OK;
-        if (w & XINPUT_GAMEPAD_B) b |= IN_BACK;
-        if ((w & XINPUT_GAMEPAD_DPAD_LEFT) || st.Gamepad.sThumbLX < -16000) b |= IN_LEFT;
-        if ((w & XINPUT_GAMEPAD_DPAD_RIGHT) || st.Gamepad.sThumbLX > 16000) b |= IN_RIGHT;
-        if ((w & XINPUT_GAMEPAD_DPAD_UP) || st.Gamepad.sThumbLY > 16000) b |= IN_UP;
-        if ((w & XINPUT_GAMEPAD_DPAD_DOWN) || st.Gamepad.sThumbLY < -16000) b |= IN_DOWN;
-        if (w & XINPUT_GAMEPAD_BACK) b |= IN_SELECT;
-    }
+    unsigned b = cellPadGetOverlayInput();
     { extern volatile unsigned g_pad_file_held;   /* v219: PAD_FILE (unattended bench driver), PS3 button mask */
       const unsigned m = g_pad_file_held;
       if (m & 0x4000) b |= IN_OK;     if (m & 0x2000) b |= IN_BACK;

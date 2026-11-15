@@ -80,6 +80,18 @@ Settings menu) is *Automatic* by default: the prompts follow the device you used
 PlayStation glyphs, Xbox, Nintendo or Steam Deck glyphs drawn in the same style, or the keyboard and mouse
 keys -- and can be fixed to any one of them.
 
+Host settings and dialog overlays accept the same controller buttons and left stick as gameplay.
+Connected controllers keep their player assignments when another controller is plugged in. If player one
+disconnects, an already connected controller takes over; reconnecting a pad fills an available slot.
+Assignments last for the running session. Xbox's physical XInput slot does not have to be slot zero.
+
+SDL controllers with enabled accelerometers/gyroscopes forward motion to the PS3 sensor report, including
+the left/right sensor variants used by paired Joy-Con. Controllers without sensors (including standard
+XInput devices) retain neutral sensor readings and do not advertise motion capability. Motion-dependent
+gameplay still needs testing with a physical controller. Adaptive triggers and advanced DualSense haptics
+are not implemented. The bundled SDL 3.4.18 Switch 2 driver does not support Bluetooth; a mapping entry
+alone does not establish support for a connection mode.
+
 Keyboard and mouse defaults (every key can be changed in `controls.ini` next to `settings.ini`, one
 `action=KEY` per line; run `Update inFamous.cmd` afterwards so the drawn key prompts follow):
 

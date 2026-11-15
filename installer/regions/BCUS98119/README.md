@@ -63,8 +63,18 @@ Any new hand-written address also needs an entry in `infamous_region.h`.
    jobs for `Update inFamous.cmd` too; the five lifted PPU units are the memory hogs.
 4. Optional: `dlss-sdk/` and `fsr-sdk/` next to the checkout before the build (README) for DLSS / FSR.
 
-Status: the US build boots, shows the autosave notice (Enter), reaches the title screen and plays at 60 fps in
-1080p with the upscaler off. On an RTX 5060 Laptop (driver 621.01, DLSS SDK 310.9.16) `UPSCALER=dlaa` hung the
+Status (checked 2026-11-14): the US build boots, reaches gameplay, and saves/loads at the opening checkpoint.
+Stable 1080p/60 is still pending: a 180-second opening/crater capture, excluding its first 30 seconds,
+averaged 58.10 fps with a 30.85 ms p99 present interval (target <=20 ms). An earlier run also encountered
+DEVICE_HUNG with upscaling off. Cold-cache DRED runs reproduced it on November 14; a short DRED-off run
+reached gameplay, but the cause remains unresolved. The renderer now honors `D3D12_DRED=0`; older builds
+enabled diagnostics even with that value. A separate frame-fence reuse bug is fixed and covered by a
+deterministic regression test; it is not yet proven to explain the intermittent device loss. DLC
+recognition survives restart, but purchase, combat use, and purchased-power persistence still need
+gameplay validation.
+See [the validation workflow](../../tools/validation/README.md) for repeatable captures.
+
+Historically, on an RTX 5060 Laptop (driver 621.01, DLSS SDK 310.9.16) `UPSCALER=dlaa` hung the
 GPU (DXGI_ERROR_DEVICE_HUNG) on the first in-world frame; run `play-dred.cmd` (the installer writes it
 next to `Play inFamous.cmd`; it adds `D3D12_DRED=1` and logs to `play-dred.err.log`) to get the
 device-removed breadcrumbs when investigating. `make_kbm_prompts.py` carries the US texture IDs of the HUD prompt

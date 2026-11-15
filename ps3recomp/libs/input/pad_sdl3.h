@@ -6,7 +6,7 @@
  *
  * cellPad's XInput sweep keeps the Xbox / XInput pads (including Steam Input's virtual ones). SDL reads the rest --
  * DualSense, DualSense Edge, DualShock 4, Steam Controller, Switch Pro and other HID gamepads -- and they fill the
- * host ports XInput left empty, in the order they were connected.
+ * stable logical ports shared with XInput. A late connection cannot steal a live assignment.
  *
  * Env: PAD_SDL=0 off (XInput only). PAD_STEAM_CONTROLLER=0 leave Steam Controllers to Steam. PAD_DEADZONE=<percent>
  *      radial stick deadzone (default 10). PAD_TOUCHPAD=0 the touchpad click does nothing (default: SELECT).
@@ -22,19 +22,24 @@ extern "C" {
 #endif
 
 typedef struct PadSdlPad {
+    uint32_t id;                  /* SDL connection identity, never a compacted array index */
     int      connected;
     uint16_t buttons;              /* CELL_PAD_CTRL_* */
     uint8_t  lx, ly, rx, ry;       /* 0..255, centre 128, up = 0 */
     uint8_t  l2, r2;               /* 0..255 */
+    uint16_t sensors[4];           /* DS3 accel XYZ and yaw, 0..1023 */
+    int motion;                   /* at least one enabled hardware sensor */
     uint8_t  type;                 /* PAD_TYPE_* (cellPad.h) of this gamepad */
 } PadSdlPad;
 
 /* Host poll thread only: SDL init on first call, hot-plug, state, rumble and light bar. */
 void pad_sdl3_update(void);
-/* Any thread: the latest state of the open gamepads in connection order; returns how many. */
+/* Any thread: the latest state of the open gamepads in stable slots (check connected); returns slot count. */
 int  pad_sdl3_get(PadSdlPad* out, int max);
-/* Any thread: PS3 actuator values for gamepad <index> (as returned by pad_sdl3_get); applied by the poll thread. */
-void pad_sdl3_rumble(int index, uint8_t small_motor, uint8_t large_motor);
+/* Poll thread only, after polling stops: stop motors, close pads, clear snapshots. */
+void pad_sdl3_stop_rumble(void);
+/* Any thread: PS3 actuator values for connection <id>; applied by the poll thread. */
+void pad_sdl3_rumble(uint32_t id, uint8_t small_motor, uint8_t large_motor);
 /* PAD_RUMBLE=0 */
 int  pad_rumble_enabled(void);
 
