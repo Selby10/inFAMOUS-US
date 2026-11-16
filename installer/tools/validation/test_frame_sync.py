@@ -19,23 +19,34 @@ typedef uint64_t u64;
 typedef long HRESULT;
 typedef struct Fake Fake;
 typedef struct {
-    void (*Signal)(Fake*, Fake*, u64);
+    HRESULT (*Signal)(Fake*, Fake*, u64);
     u32 (*GetCurrentBackBufferIndex)(Fake*);
     u64 (*GetCompletedValue)(Fake*);
-    void (*SetEventOnCompletion)(Fake*, u64, void*);
+    HRESULT (*SetEventOnCompletion)(Fake*, u64, void*);
     HRESULT (*GetDeviceRemovedReason)(Fake*);
 } Vtable;
 struct Fake { Vtable* lpVtbl; };
 static u64 completed, queued, target;
+static int failure;
 static u32 next_index, waits;
-static void signal_queue(Fake* q, Fake* f, u64 value) { queued = value; }
+static HRESULT signal_queue(Fake* q, Fake* f, u64 value) { queued = value; return failure == 1 ? -1 : 0; }
 static u32 buffer_index(Fake* s) { return next_index; }
-static u64 completed_value(Fake* f) { return completed; }
-static void set_event(Fake* f, u64 value, void* e) { target = value; }
-static HRESULT removed_reason(Fake* d) { return 0; }
+static u64 completed_value(Fake* f) { return failure == 3 ? UINT64_MAX : completed; }
+static HRESULT set_event(Fake* f, u64 value, void* e) { target = value; return failure == 2 ? -1 : 0; }
+static HRESULT removed_reason(Fake* d) { return failure == 5 ? -1 : 0; }
+#include <stdlib.h>
+#define FAILED(x) ((x)<0)
+#define E_FAIL (-1)
+#define WAIT_OBJECT_0 0
 #define WAIT_TIMEOUT 258
+typedef unsigned long DWORD;
+static int timeouts;
+static void d3d12_sync_fatal(const char* where, HRESULT hr) { exit(91); }
 static int WaitForSingleObject(void* e, int timeout) {
     waits++;
+    if (failure == 4) return 0xFFFFFFFF;
+    if (failure == 5) return WAIT_TIMEOUT;
+    if (timeouts > 0) { timeouts--; return WAIT_TIMEOUT; }
     completed = target;
     return 0;
 }
@@ -50,7 +61,8 @@ static struct {
 '''
 
 CHECK = r'''
-int main(void) {
+int main(int argc, char** argv) {
+    if (argc > 1) { failure = atoi(argv[1]); move_to_next_frame(); return 9; }
     /* The prepass GPU wait completed value 7, then a new list was submitted.
      * Offscreen rendering/occlusion leaves the backbuffer index unchanged. */
     completed = 7;
@@ -68,6 +80,9 @@ int main(void) {
     move_to_next_frame();
     if (queued <= 12 || target != 11 || waits != 1) return 2;
     if (s_d3d.frame_index != 1 || s_d3d.fence_values[1] <= queued) return 3;
+    completed = 0; waits = 0; timeouts = 1;
+    wait_for_fence(20);
+    if (waits != 2 || completed < 20) return 4;
     return 0;
 }
 '''
@@ -82,7 +97,9 @@ class FrameSyncTests(unittest.TestCase):
         source = (root / 'ps3recomp/libs/video/rsx_d3d12_backend.c').read_text(encoding='utf-8')
         begin = source.index('static void move_to_next_frame(void)\n{')
         end = source.index('\n}\n', begin) + 3
-        function = source[begin:end]
+        helper = source.index('static void wait_for_fence(u64 target)\n{')
+        helper_end = source.index('\n}\n', helper) + 3
+        function = source[helper:helper_end] + source[begin:end]
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             unit = directory / 'sync.c'
@@ -95,6 +112,9 @@ class FrameSyncTests(unittest.TestCase):
             built = subprocess.run(args, cwd=directory, capture_output=True, text=True)
             self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
             self.assertEqual(subprocess.run([str(exe)], cwd=directory).returncode, 0)
+            for failure in range(1, 6):
+                with self.subTest(failure=failure):
+                    self.assertEqual(subprocess.run([str(exe), str(failure)], cwd=directory).returncode, 91)
 
 
 if __name__ == '__main__':

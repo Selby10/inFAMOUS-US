@@ -258,7 +258,7 @@ configure = ["{cmake}", "-S", "{port}", "-B", "{port}/build-install", "-G", "Nin
              "-DPORT_REQUIRE_SDL3=ON",
              "-DPORT_SCRUB_PRIVATE=ON",
              "-DPS3RECOMP_DIR={toolkit}",
-             "-DPython3_EXECUTABLE={python}"]
+             "-DPython3_EXECUTABLE={python}", "-DINFAMOUS_GAME_SFO={game}/PS3_GAME/PARAM.SFO"]
 compile = ["{cmake}", "--build", "{port}/build-install", "--parallel", "{build_jobs}"]
 exe = "{port}/build-install/inFamousRecomp.exe"
 log = "{port}/build-install.log"
@@ -269,7 +269,7 @@ configure_unix = ["{cmake}", "-S", "{port}", "-B", "{port}/build-install", "-G",
                   "-DCMAKE_BUILD_TYPE=Release",
                   "-DPORT_PPU_REGCACHE=ON",
                   "-DPS3RECOMP_DIR={toolkit}",
-                  "-DPython3_EXECUTABLE={python}"]
+                  "-DPython3_EXECUTABLE={python}", "-DINFAMOUS_GAME_SFO={game}/PS3_GAME/PARAM.SFO"]
 compile_unix = ["{cmake}", "--build", "{port}/build-install", "--parallel", "{build_jobs}"]
 exe_unix = "{port}/build-install/inFamousRecomp"
 

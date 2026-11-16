@@ -109,3 +109,33 @@ no device loss, crash, softlock or save/progression regression. Verify audio,
 keyboard/mouse and controller, vegetation/streaming, earn 600 XP naturally,
 buy/use Gigawatt Blades, save/restart and verify the purchased power. A short
 opening run or a nonreproduced hang does not satisfy this milestone.
+
+
+### Automated idle checks
+
+Use `--auto-close` to request normal window closure at the collection deadline.
+If closure fails, the runner terminates its own game after 15 seconds and records
+`forced_cleanup`; this is not a clean-exit acceptance result. `--collector-direct`
+uses existing ETW permissions without a UAC prompt; insufficient permissions remain
+a failed collection. `--scripted-input --hold-neutral` centers the sticks for an
+idle checkpoint comparison. It does not simulate a street/combat/rooftop route.
+`--env BENCH_SHOT=<private request path>` enables the existing runtime screenshot
+channel; create that file to capture `<path>.bmp`. Never publish these captures.
+
+For baseline comparisons run three 180-second captures per warm/cold cache condition
+with 1080p, cap 60, upscaling off and FG off. Analyze seconds 30-180 only after
+confirming the same loaded checkpoint and successful collection. Device failure,
+forced cleanup, missing/empty frame data, or unverified normal mode prevent a pass.
+Optional DLAA/DLSS/FSR/FG modes require their SDKs and supported hardware; a missing
+SDK is untested, not a successful fallback test. Keep changes to one setting per run.
+
+
+`run_matrix.py` accepts `--root`, `--elf`, `--hdd-root`, `--output-root` and
+`--presentmon`. It runs three cold and three warm idle-checkpoint captures,
+requests closure after each, and writes `matrix-summary.json`. Supply a private
+HDD/save copy. It never elevates the collector or changes execution policy.
+Collection errors and incomplete intervals cannot pass; device loss or forced
+cleanup stops the series. Stop the supervisor and close its validation-owned game,
+then verify cache restoration before handing the game back for manual play.
+Do not start a normal game alongside a benchmark. A passing idle matrix still does
+not replace marked traversal/combat/rooftop acceptance.

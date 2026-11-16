@@ -21,3 +21,12 @@ installer (see `../installer`) and are never part of this repository.
 After an install, `build.cmd` rebuilds into `build-fast` with Visual Studio
 Build Tools, Ninja and clang-cl. It uses `python` from your PATH, or the one in
 the `PYTHON` environment variable.
+
+
+## Region validation
+
+Installer builds pass `-DINFAMOUS_GAME_SFO=<absolute PARAM.SFO path>` automatically.
+Manual builds discover exactly one of the standard US/European dump locations;
+when both are present, pass the intended SFO explicitly. Missing, malformed and
+unsupported title IDs stop configuration instead of silently compiling EU addresses.
+Both BCUS98119 and BCES00220 remain supported. The region helper uses only metadata.

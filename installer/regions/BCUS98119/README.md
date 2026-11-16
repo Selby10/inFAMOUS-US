@@ -80,3 +80,27 @@ next to `Play inFamous.cmd`; it adds `D3D12_DRED=1` and logs to `play-dred.err.l
 device-removed breadcrumbs when investigating. `make_kbm_prompts.py` carries the US texture IDs of the HUD prompt
 textures (`core.xpp` object IDs differ per release); `make_kbm_icons.py` reads the pipeline's
 `assets/font_icons_l0.bin`.
+
+
+### Automated follow-up (2026-11-16)
+
+GPU synchronization now checks Signal/SetEventOnCompletion/wait failures and the
+UINT64_MAX device-removal sentinel. A timeout on a live device rechecks completion
+instead of allowing allocator/resource reuse; failed synchronization exits with a
+GPU SYNC FAILED diagnostic and DRED data when enabled. Native tests cover unchanged
+backbuffers, delayed completion and five failure paths. This closes a demonstrated
+unsafe continuation path; it does not prove every intermittent hang is resolved.
+
+The rebuilt US executable completed a 180-second cold-cache DRED smoke run with no
+logged device failure, normal closure and cache restoration. A subsequent normal
+cold-cache idle capture averaged 58.70 FPS with 25.23 ms p99 present interval, so the
+20 ms target remains unmet. Automated repetitions were interrupted for physical
+controller use; a second capture overlapped another game instance and is invalid
+for performance comparison. Do not count this as the six-run or route milestone.
+The installed build lacks DLSS/FSR SDKs; optional graphics modes remain untested.
+
+Region selection now validates PARAM.SFO explicitly, and CI runs Rust/native tests
+and US patch synchronization. Launcher and in-game FPS choices include 30, 60,
+120, 144 and 240 (also retaining Off/40/45/50). The runtime rejects duplicate game
+launches while permitting its separate log-drain helper. Physical gameplay,
+visual/audio correctness and DLC persistence remain manual acceptance items.

@@ -2199,64 +2199,54 @@ static int init_d3d12(u32 width, u32 height)
  * Frame sync helpers
  * -----------------------------------------------------------------------*/
 
-static void wait_for_gpu(void)
+/* A failed fence is not permission to recycle resources. In particular,
+ * GetCompletedValue returns UINT64_MAX on device removal, not completion. */
+static void d3d12_sync_fatal(const char* where, HRESULT hr)
 {
-    u32 fi = s_d3d.frame_index;
-    s_d3d.fence_values[fi]++;
-    s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_d3d.fence, s_d3d.fence_values[fi]);
+    fprintf(stderr, "[D3D12] GPU SYNC FAILED: %s (0x%08lX); stopping before unsafe resource reuse. See game logs.\n",
+            where, (unsigned long)hr);
+    d3d12_dred_report();
+    fflush(NULL);
+    exit(EXIT_FAILURE);
+}
 
-    if (s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence) < s_d3d.fence_values[fi]) {
-        s_d3d.fence->lpVtbl->SetEventOnCompletion(
-            s_d3d.fence, s_d3d.fence_values[fi], s_d3d.fence_event);
-        /* NEVER wait unbounded here: this runs on the vblank ticker, which also
-         * drives the guest's vblank handlers, the FIFO drain, and the fence
-         * publication. A device removal (TDR) leaves the D3D12 fence unsignaled
-         * forever and an INFINITE wait silently froze the ENTIRE emulation --
-         * observed on LBP as a boot that died the moment the 2048x2048
-         * offscreen RT was created (last log line), every guest thread parked.
-         * Degrade loudly instead: bounded waits + the removal reason, then
-         * carry on (subsequent D3D calls fail visibly but the game keeps
-         * running headless). */
-        for (int tries = 0; tries < 3; tries++) {
-            if (WaitForSingleObject(s_d3d.fence_event, 2000) != WAIT_TIMEOUT)
-                return;
-            HRESULT rr = s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device);
-            fprintf(stderr, "[D3D12] wait_for_gpu STUCK %ds: want %llu got %llu removed=0x%08lX\n",
-                   2 * (tries + 1),
-                   (unsigned long long)s_d3d.fence_values[fi],
-                   (unsigned long long)s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence),
-                   (long)rr);
-            fflush(stderr);
-            if (rr != 0 /* S_OK: device still alive, keep waiting a bit */)
-                break;
+static void wait_for_fence(u64 target)
+{
+    for (;;) {
+        u64 completed = s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence);
+        if (completed == UINT64_MAX)
+            d3d12_sync_fatal("device removed", s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device));
+        if (completed >= target) return;
+        HRESULT hr = s_d3d.fence->lpVtbl->SetEventOnCompletion(s_d3d.fence, target, s_d3d.fence_event);
+        if (FAILED(hr)) d3d12_sync_fatal("SetEventOnCompletion", hr);
+        DWORD result = WaitForSingleObject(s_d3d.fence_event, 2000);
+        if (result != WAIT_OBJECT_0 && result != WAIT_TIMEOUT)
+            d3d12_sync_fatal("WaitForSingleObject", E_FAIL);
+        if (result == WAIT_TIMEOUT) {
+            hr = s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device);
+            if (FAILED(hr)) d3d12_sync_fatal("fence timeout/device removed", hr);
+            /* A live but slow GPU still owns the allocation. Recheck completion;
+             * never reset its allocator merely because the CPU wait expired. */
         }
     }
 }
 
+static void wait_for_gpu(void)
+{
+    const u64 fence_val = ++s_d3d.fence_values[s_d3d.frame_index];
+    HRESULT hr = s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_d3d.fence, fence_val);
+    if (FAILED(hr)) d3d12_sync_fatal("Signal", hr);
+    wait_for_fence(fence_val);
+}
+
 static void move_to_next_frame(void)
 {
-    /* wait_for_gpu() may have already signaled and completed this slot's
-     * value BEFORE the list we just submitted. Give the submission a fresh
-     * value so an unchanged backbuffer index (offscreen batch/occlusion)
-     * cannot skip its wait and reset an allocator still used by the GPU. */
+    /* Always signal AFTER submission, even when the backbuffer did not change. */
     u64 current_fence = ++s_d3d.fence_values[s_d3d.frame_index];
-    s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_d3d.fence, current_fence);
-
+    HRESULT hr = s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_d3d.fence, current_fence);
+    if (FAILED(hr)) d3d12_sync_fatal("Signal", hr);
     s_d3d.frame_index = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
-
-    if (s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence) < s_d3d.fence_values[s_d3d.frame_index]) {
-        s_d3d.fence->lpVtbl->SetEventOnCompletion(
-            s_d3d.fence, s_d3d.fence_values[s_d3d.frame_index], s_d3d.fence_event);
-        if (WaitForSingleObject(s_d3d.fence_event, 2000) == WAIT_TIMEOUT) {
-            HRESULT rr = s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device);
-            fprintf(stderr, "[D3D12] FENCE STUCK 2s: want %llu got %llu removed=0x%08lX\n",
-                   (unsigned long long)s_d3d.fence_values[s_d3d.frame_index],
-                   (unsigned long long)s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence),
-                   (long)rr);
-            fflush(stderr);
-        }
-    }
-
+    wait_for_fence(s_d3d.fence_values[s_d3d.frame_index]);
     s_d3d.fence_values[s_d3d.frame_index] = current_fence + 1;
 }
 

@@ -17,7 +17,7 @@ import tomllib
 from analyze_frames import analyze
 
 # Existing renderer experiments, deliberately opt-in and recorded per run.
-PROFILE_OVERRIDES = {'TEXCS', 'TEXCS_THREADS', 'TEXCS_EARLY', 'TEXCS_PHASE',
+PROFILE_OVERRIDES = {'BENCH_SHOT', 'TEXCS', 'TEXCS_THREADS', 'TEXCS_EARLY', 'TEXCS_PHASE',
                      'TEXCS_PHASE_DIV', 'TEXCS_ECORE', 'TEX_FAST_DECODE',
                      'HITCH_MS', 'HITCH_MAX', 'SPIKE_MS', 'SPIKE_MAX'}
 
@@ -78,6 +78,25 @@ def configure_scripted_input(env, run, enabled=False):
         env['PAD_FILE'] = str(path)
 
 
+def request_game_close(pid):
+    """Post WM_CLOSE only to windows owned by the validation child."""
+    import ctypes
+    from ctypes import wintypes
+    user = ctypes.WinDLL('user32', use_last_error=True)
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+    @callback_type
+    def close(hwnd, parameter):
+        owner = wintypes.DWORD()
+        user.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == pid:
+            user.PostMessageW(hwnd, 0x10, 0, 0)
+        return True
+    user.EnumWindows(close, 0)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, required=True)
@@ -85,6 +104,8 @@ def main():
     parser.add_argument('--hdd-root', type=Path, required=True)
     parser.add_argument('--output-root', type=Path, required=True)
     parser.add_argument('--presentmon', type=Path)
+    parser.add_argument('--collector-direct', action='store_true', help='Use existing ETW permissions; never prompt for elevation')
+    parser.add_argument('--hold-neutral', action='store_true', help='Hold centered scripted sticks for an idle baseline')
     parser.add_argument('--powershell', default=shutil.which('pwsh') or 'powershell.exe',
                         help='PowerShell host allowed to execute local scripts; no policy is changed')
     parser.add_argument('--seconds', type=int, default=1800)
@@ -92,9 +113,13 @@ def main():
     parser.add_argument('--mode', choices=('normal', 'timing', 'dred', 'debug'), default='normal')
     parser.add_argument('--cache', choices=('warm', 'cold'), default='warm')
     parser.add_argument('--env', action='append', default=[])
+    parser.add_argument('--auto-close', action='store_true',
+                        help='Request normal closure after collection; forced cleanup is recorded as failed')
     parser.add_argument('--scripted-input', action='store_true',
                         help='Opt in to an initially empty PAD_FILE command channel for automated input')
     args = parser.parse_args()
+    if args.hold_neutral and not args.scripted_input:
+        parser.error('--hold-neutral requires --scripted-input')
     if args.seconds < 1:
         parser.error('--seconds must be positive')
     root = args.root.resolve(strict=True)
@@ -113,6 +138,8 @@ def main():
     run = args.output_root.resolve() / dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f')
     run.mkdir(parents=True)
     configure_scripted_input(env, run, args.scripted_input)
+    if args.hold_neutral:
+        Path(env['PAD_FILE']).write_text('0 0 128 128 128 128', encoding='ascii')
     settings_path = port / 'settings.ini'
     settings = settings_path.read_text() if settings_path.exists() else ''
     (run / 'settings.ini').write_text(settings)
@@ -125,6 +152,8 @@ def main():
         recorded_env[key] = env.get(key)  # null means deliberately unset
     record = dict(schema_version=1, status='starting', created_utc=utc(), scenario=args.scenario,
                   mode=args.mode, cache=args.cache, requested_seconds=args.seconds,
+                  automatic_close=args.auto_close, hold_neutral=args.hold_neutral,
+                  collector_direct=args.collector_direct,
                   executable=str(exe), executable_sha256=hashlib.sha256(exe.read_bytes()).hexdigest(),
                   source_commit=command_output(['git', 'rev-parse', 'HEAD'], root),
                   source_changes=command_output(['git', 'diff', '--stat'], root),
@@ -152,16 +181,35 @@ def main():
             write_json(run / 'run.json', record)
             if args.presentmon:
                 with (run / 'profiler-launch.log').open('w') as collector_log:
-                    collector = subprocess.Popen([args.powershell, '-NoProfile', '-File',
-                        str(Path(__file__).resolve().with_name('collect_presentmon.ps1')), '-PresentMon',
-                        str(args.presentmon.resolve()), '-GameProcessId', str(game.pid),
-                        '-Seconds', str(args.seconds), '-RunDirectory', str(run)],
-                        stdout=collector_log, stderr=subprocess.STDOUT,
-                        creationflags=subprocess.CREATE_NO_WINDOW)
+                    if args.collector_direct:
+                        collector = subprocess.Popen([str(args.presentmon.resolve()),
+                            '--process_id', str(game.pid), '--timed', str(args.seconds),
+                            '--terminate_after_timed', '--no_console_stats', '--v1_metrics',
+                            '--session_name', 'Infamous-' + str(game.pid), '--terminate_on_proc_exit',
+                            '--output_file', str(run / 'frames.csv')],
+                            stdout=collector_log, stderr=subprocess.STDOUT,
+                            creationflags=subprocess.CREATE_NO_WINDOW)
+                        write_json(run / 'profiler.json', dict(status='running', started_utc=utc()))
+                    else:
+                        collector = subprocess.Popen([args.powershell, '-NoProfile', '-File',
+                            str(Path(__file__).resolve().with_name('collect_presentmon.ps1')), '-PresentMon',
+                            str(args.presentmon.resolve()), '-GameProcessId', str(game.pid),
+                            '-Seconds', str(args.seconds), '-RunDirectory', str(run)],
+                            stdout=collector_log, stderr=subprocess.STDOUT,
+                            creationflags=subprocess.CREATE_NO_WINDOW)
             started = time.monotonic()
+            close_requested = None
             with (run / 'gpu.csv').open('w') as gpu:
                 gpu.write('timestamp,name,utilization.gpu,memory.used,temperature.gpu,power.draw,clocks.gr\n')
                 while game.poll() is None:
+                    if args.auto_close and time.monotonic() - started >= args.seconds:
+                        if close_requested is None:
+                            close_requested = time.monotonic()
+                            record['automatic_close_requested'] = True
+                            request_game_close(game.pid)
+                        elif time.monotonic() - close_requested >= 15:
+                            record['forced_cleanup'] = True
+                            game.terminate()
                     if time.monotonic() - started <= args.seconds:
                         gpu.write(command_output(['nvidia-smi',
                             '--query-gpu=timestamp,name,utilization.gpu,memory.used,temperature.gpu,power.draw,clocks.gr',
@@ -177,6 +225,10 @@ def main():
                 # Some PresentMon versions finish at --timed even after process
                 # exit. Wait for that flush rather than misclassify a locked CSV.
                 record['collector_exit_code'] = collector.wait(timeout=args.seconds + 30)
+                if args.collector_direct:
+                    write_json(run / 'profiler.json', dict(
+                        status='completed' if collector.returncode == 0 else 'failed',
+                        exit_code=collector.returncode, ended_utc=utc()))
             except subprocess.TimeoutExpired:
                 record['collector_error'] = 'Collector still running; CSV may be locked/incomplete'
         logs = (run / 'game.out.log').read_text(errors='replace') + (run / 'game.err.log').read_text(errors='replace')
@@ -186,8 +238,11 @@ def main():
         record['performance_mode_verified'] = (args.mode == 'normal' and
             record['dred_observed'] == 'disabled' and not record['debug_layer_observed'] and
             all(env[key] == '0' for key in ('PS3_TELEM', 'GPUPROF', 'PERF')))
-        record['device_failure'] = 'PRESENT FAILED' in logs or 'FENCE STUCK' in logs or 'wait_for_gpu STUCK' in logs
+        record['device_failure'] = any(marker in logs for marker in
+            ('PRESENT FAILED', 'FENCE STUCK', 'wait_for_gpu STUCK', 'GPU SYNC FAILED'))
         record['status'] = 'completed' if game.returncode == 0 else 'game_failed'
+        if record.get('forced_cleanup'):
+            record['status'] = 'forced_cleanup'
         if record['device_failure']:
             record['status'] = 'device_failed'
         if args.presentmon:

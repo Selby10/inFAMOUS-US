@@ -4,10 +4,17 @@ on:
   push:
     paths:
       - "installer/**"
+      - "infamous-recomp/**"
+      - "ps3recomp/**"
+      - "sdl3/**"
       - ".github/workflows/setup-app.yml"
   pull_request:
     paths:
+      - ".github/workflows/setup-app.yml"
       - "installer/**"
+      - "infamous-recomp/**"
+      - "ps3recomp/**"
+      - "sdl3/**"
   workflow_dispatch:
 
 jobs:
@@ -27,6 +34,27 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --check
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Rust regressions
+        run: cargo test --locked
+
+      - name: Native regressions and regional synchronization
+        shell: pwsh
+        run: |
+          if (-not (Get-Command cl -ErrorAction SilentlyContinue) -or -not (Get-Command clang -ErrorAction SilentlyContinue)) { throw 'Native tests require cl and clang' }
+          if (-not (Test-Path ../sdl3/lib/x64/SDL3.dll)) { throw 'SDL3 runtime missing' }
+          python regions/BCUS98119/tools/check_sync.py ..
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m unittest discover -s tools/validation -p "test_*.py"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build
         run: cargo build --release --locked

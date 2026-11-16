@@ -49,19 +49,24 @@ if(PORT_SCRUB_PRIVATE AND EXISTS "${_scrub_root}/.installer"
 endif()
 
 # Release of the linked dump: the US executable's functions have other addresses (infamous_region.h).
+set(INFAMOUS_GAME_SFO "" CACHE FILEPATH "PARAM.SFO of the dump being compiled")
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+set(_region_args --root "${CMAKE_CURRENT_SOURCE_DIR}/..")
+if(INFAMOUS_GAME_SFO)
+    list(APPEND _region_args --sfo "${INFAMOUS_GAME_SFO}")
+endif()
+execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/detect_region.py" ${_region_args}
+    RESULT_VARIABLE _region_result OUTPUT_VARIABLE _region_id ERROR_VARIABLE _region_error
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(NOT _region_result EQUAL 0)
+    message(FATAL_ERROR "${_region_error}")
+endif()
 set(INFAMOUS_REGION_US OFF)
-set(_region_sfo "${CMAKE_CURRENT_SOURCE_DIR}/../Infamous (US)/PS3_GAME/PARAM.SFO")
-if(NOT EXISTS "${_region_sfo}")
-    set(_region_sfo "${CMAKE_CURRENT_SOURCE_DIR}/../Infamous (Europe) (Fr,De,Es,It,Nl)/PS3_GAME/PARAM.SFO")
+if(_region_id STREQUAL "BCUS98119")
+    set(INFAMOUS_REGION_US ON)
+    add_compile_definitions(INFAMOUS_REGION_US=1)
 endif()
-if(EXISTS "${_region_sfo}")
-    file(STRINGS "${_region_sfo}" _region_id REGEX "BCUS98119")
-    if(_region_id)
-        set(INFAMOUS_REGION_US ON)
-        add_compile_definitions(INFAMOUS_REGION_US=1)
-        message(STATUS "Game release: US (BCUS98119)")
-    endif()
-endif()
+message(STATUS "Game release: ${_region_id}")
 
 # ---------------------------------------------------------------------------
 # v189 PORT_PGO: profile-guided optimisation for EVERYTHING (lifted PPU + SPU, runtime, renderer).
