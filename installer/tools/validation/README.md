@@ -139,3 +139,9 @@ cleanup stops the series. Stop the supervisor and close its validation-owned gam
 then verify cache restoration before handing the game back for manual play.
 Do not start a normal game alongside a benchmark. A passing idle matrix still does
 not replace marked traversal/combat/rooftop acceptance.
+
+`test_save_slots.py` compiles the savedata service and uses guest callbacks with
+isolated files to verify independent manual slots, autosave preservation, overwrite,
+load bytes, US/EU slot filtering and populated-slot metadata. It does not use the
+player's save tree. UI/controller checks and real game progression after loading
+a different slot remain separate acceptance checks.

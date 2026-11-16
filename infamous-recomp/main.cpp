@@ -65,6 +65,8 @@
 extern "C" {
 uint32_t ppu_load_elf(const char* path);      /* ELF -> guest RAM, returns entry OPD */
 void     ppu_recomp_register(void);           /* generated: lifted table -> address map */
+unsigned cellPadGetOverlayInput(void);
+void     cellSaveData_set_slot_input(unsigned (*reader)(void));
 void     ppu_hle_init(void);                  /* firmware import NID -> HLE handler */
 void     ppu_sysprx_register(void);           /* boot-critical CRT (sys_initialize_tls, ...) */
 void     ppu_fs_register(void);               /* cellFs over the real game directory */
@@ -580,7 +582,7 @@ static void load_settings_ini(void)
     FILE* f = fopen("settings.ini", "r");
     if (!f) return;
     static const char* keys[] = { "FULLSCREEN", "PRESENT_VSYNC", "UI_FPS_CAP", "KBM_GLYPHS", "PAD_MOUSE_SPEED",
-                                  "RES_SCALE", "SHADOWS", "TEX_ANISO", "TEX_MIPS",
+                                  "WINDOW_SIZE", "RES_SCALE", "SHADOWS", "TEX_ANISO", "TEX_MIPS",
                                   "UPSCALER", "FSR_FG", "PS3_LANG" };   /* v243K menu rows (were silently dropped) */
     char line[256]; int n = 0;
     while (fgets(line, sizeof line, f)) {
@@ -897,6 +899,20 @@ int main(int argc, char** argv)
 #ifdef _WIN32
     /* v241C LOG_ASYNC drain helper process (see v241c_la): nothing else runs in it */
     if (argc >= 2 && strcmp(argv[1], "--v241c-logdrain") == 0) return v241c_la::helper_main(argc, argv);
+    /* The log-drain child bypasses this guard above. Keep the handle open
+     * for the game lifetime; Windows releases it even after a crash. */
+    HANDLE game_instance = CreateMutexW(NULL, FALSE, L"Local\\inFamousRecomp.Game");
+    if (!game_instance) {
+        fprintf(stderr, "[boot] Could not acquire game instance guard (error %lu)\n", GetLastError());
+        return 1;
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(game_instance);
+        fprintf(stderr, "[boot] inFamous is already running; second game launch ignored.\n");
+        return 0;
+    }
+    /* Window Size uses physical pixels even on laptop displays scaled above 100%. */
+    SetProcessDPIAware();
     /* v242B PS3_AFFINITY=<hex mask> (default unset = nothing): restrict the whole process to those logical CPUs
      * BEFORE any thread exists (weak-PC emulation / user choice). bench_drive's BENCH_AFFINITY only applies the mask
      * after the start, so threads sized at boot saw all CPUs. Bits outside the system mask are ignored. */
@@ -910,6 +926,7 @@ int main(int argc, char** argv)
      * messages below); changing buffering after I/O is undefined by stdio. */
     configure_stdout_buffering();
     load_settings_ini();
+    cellSaveData_set_slot_input(cellPadGetOverlayInput);
     /* v242B LOW_CPU=1 (default OFF): opt-in preset for weak CPUs. These are QUALITY levers -- the game looks/animates
      * differently from the default -- so the preset only exists for users who choose it:
      *   ANIM_LOD=1        (v216) low-detail skeletons (job size <= ANIM_LOD_MAX) update their animation every other

@@ -71,6 +71,52 @@ Run **inFamous** (the shortcut Setup made). It opens a small options window firs
 **Play** starts the game. The same settings are in the game's pause menu under
 **Settings**. Controllers work as on the console, and keyboard and mouse are supported.
 
+Frame Rate Limit in the launcher and in-game settings supports Off, 30, 40, 45,
+50, 60, 120, 144 and 240 FPS. These are caps; achievable FPS depends on the scene
+and hardware. The existing default remains 60 FPS.
+
+For laptop windowed play, choose **Windowed** and set **Window Size** separately
+from **Game Resolution** in the launcher or in-game Settings:
+
+| Use | Window Size | Game Resolution |
+|---|---|---|
+| Smaller window with room for other apps | 720p (1280 x 720) | 720p |
+| Larger window with lighter rendering | 1080p (1920 x 1080) | 720p |
+
+Windows too large for the desktop are fitted while keeping their aspect ratio.
+Window Size and Game Resolution changes take effect after restarting the game.
+**Match Game Resolution** preserves the previous window-sizing behavior. Fullscreen
+uses the monitor; the Window Size choice is used when returning to windowed mode.
+
+### Settings and save manager
+
+The launcher now has **Settings** and **Saves** tabs. Saves shows the active save
+folder, US/European save slots and last-modified times in UTC. Use **Open Save
+Folder**, **Back Up Saves**, **Back Up Settings**, or **Back Up Everything**.
+Settings backups include `settings.ini` and `controls.ini` when present.
+
+Choose a snapshot and **Saves only**, **Settings only**, or **Saves and settings**
+before restoring. The game must be closed for backups/restores. Restore verifies
+the snapshot and creates a **before-restore** recovery backup first; unrelated
+saves are kept. Pending settings changes must be saved before backing them up.
+Resetting settings does not reset game progress. In the game's pause menu, **Save Game**
+opens ten manual slots and **Load Game** lists existing saves, including the separate
+autosave. Slot 1 is your existing manual save; slots 2-10 add independent saves.
+Occupied slots show checkpoint details and a UTC timestamp. Saving over one requires
+a second **Overwrite** confirmation. Cancel leaves the slot untouched. Keyboard,
+mouse and controller (Up/Down, A/Cross, B/Circle) work in the selector.
+
+The manager footer credits **Whompay / inFAMOUSreborn** for the original European ISO
+port (`BCES00220`), **WoofahRayetCode / inFAMOUS-US** for this US ISO fork (`BCUS98119`),
+and **sp00nznet / ps3recomp** for the recompiler foundation, with links to each repo.
+
+Snapshots are local folders under `infamous-recomp/user-backups`, with per-file
+SHA-256 verification. Keep the entire snapshot folder together when copying it.
+Replaced originals are also retained in `.restore-*` transaction folders for
+recovery; snapshots and transaction folders are excluded from Git and exports.
+After restoring different keyboard bindings, follow the existing keyboard-prompt
+refresh instructions below.
+
 ### Controls and button prompts
 
 Xbox pads (and Steam Input's virtual pads) work through XInput; DualShock 4, DualSense, Switch Pro, Joy-Con,
@@ -179,6 +225,8 @@ layout from step 2, then repeat step 3.
 
 ## Credits
 
+- Original European ISO port (`BCES00220`): [Whompay / inFAMOUSreborn](https://github.com/whompay/inFAMOUSreborn).
+- US ISO adaptation (`BCUS98119`): [WoofahRayetCode / inFAMOUS-US](https://github.com/WoofahRayetCode/inFAMOUS-US).
 - [ps3recomp](https://github.com/sp00nznet/ps3recomp) by sp00nznet and
   contributors (see [ps3recomp/CONTRIBUTORS.md](ps3recomp/CONTRIBUTORS.md)).
 - [RPCS3](https://rpcs3.net), used to decrypt the game executable.

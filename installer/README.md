@@ -166,3 +166,32 @@ units are CRLF except `ppu_recomp_000.cpp`, and the SPU sources are LF while `sp
 file use different endings throughout, the patch starts with `# eol lf` (or `# eol crlf`): the
 installer converts the file's endings first and then applies the hunks, so the patch holds only the
 real edits instead of every line. Run `make-patches` on Windows, because that is what players run.
+
+
+### Launcher save management
+
+The launcher resolves `SAVEDATA_ROOT` with the same launch environment as the game;
+without an override it uses `<game working folder>/gamedata/dev_hdd0/home/00000001/savedata`.
+It does not infer saves from `PS3_HDD0_ROOT`, because the runtime's save subsystem
+uses its own override. Settings stay in the working folder. Backup/restore holds
+the game's named instance guard so a concurrent game cannot start mid-operation.
+Snapshots include only BCUS98119/BCES00220 save directories and optional settings/
+keybindings. No DLC/license files or generated assets are bundled. Restore verifies
+hashes and rejects unsafe paths or linked content before replacing data, stages
+replacements on the destination volume, and rolls back committed replacements on
+failure. Recovery snapshots and original transaction files are retained.
+
+### Credits and in-game save slots
+
+The Settings/Saves manager identifies this US ISO fork as
+[WoofahRayetCode/inFAMOUS-US](https://github.com/WoofahRayetCode/inFAMOUS-US),
+credits [Whompay/inFAMOUSreborn](https://github.com/whompay/inFAMOUSreborn) for the
+original European ISO port (`BCES00220`), and links the ps3recomp foundation.
+
+With the shipped `SAVEDATA_NATIVE_UI=1`, the game's explicit Save Game/Load Game
+operations open a slot selector. US and EU saves retain their region-specific
+`*_INFAMOUS_0` autosave and `*_INFAMOUS_1` existing manual save; manual slots 2-10
+use the same prefix and remain discoverable by the manager and its backups.
+Save lists all ten manual slots; Load lists populated slots plus autosave.
+Overwrite requires confirmation. AutoSave/AutoLoad stay noninteractive and retain
+their original paths. Setting `SAVEDATA_NATIVE_UI=0` preserves headless behavior.

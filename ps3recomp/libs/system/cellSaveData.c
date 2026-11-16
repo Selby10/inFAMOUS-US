@@ -6,6 +6,7 @@
  */
 
 #include "cellSaveData.h"
+#include "savedata_slots.h"
 #include "ps3emu/guest_call.h"
 #include "../../runtime/ppu/ppu_memory.h"
 #include "../../runtime/memory/vm.h"
@@ -814,16 +815,22 @@ static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* p
     fclose(fp);
 }
 
-/* ListSave/ListLoad normally ask the PS3 firmware to display a selector.  The
- * static runtime has no firmware compositor, so a perfectly successful file
- * operation used to look like a dead button.  inFamous exposes one fixed slot;
- * a native confirmation gives that slot visible, cancellable UI without
- * making automatic boot loads or checkpoint saves interactive. */
-static int savedata_native_confirm(const char* dirName, int is_save)
+/* The game supplies the host input reader, keeping this service independent of
+ * the renderer and input libraries in standalone/runtime tests. */
+static unsigned (*s_slot_input)(void);
+volatile int g_savedata_slot_dialog_active;
+void cellSaveData_set_slot_input(unsigned (*reader)(void)) { s_slot_input = reader; }
+#include "savedata_slot_dialog.h"
+
+/* Only explicit ListSave/ListLoad show a selector; automatic checkpoint/boot
+ * operations keep their original directory and never show interactive UI. */
+static int savedata_native_confirm(char dirName[64], int is_save)
 {
 #ifdef _WIN32
     const char* e = getenv("SAVEDATA_NATIVE_UI");
     if (!e || !e[0] || e[0] == '0') return 1;
+    if (savedata_infamous_slot(dirName) >= 0)
+        return savedata_choose_infamous_slot(dirName, is_save);
 
     char path[1024];
     CellSaveDataSystemFileParam param;

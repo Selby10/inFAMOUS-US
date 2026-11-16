@@ -174,6 +174,15 @@ static volatile ULONGLONG s_tr_close_ms = 0;
 static volatile int s_tr_need_clear = 0;
 int uiov_pad_gate(void)
 {
+    extern volatile int g_savedata_slot_dialog_active;
+    static int slot_was_open;
+    static ULONGLONG slot_closed_ms;
+    if (g_savedata_slot_dialog_active) { slot_was_open = 1; return 1; }
+    if (slot_was_open) { slot_was_open = 0; slot_closed_ms = GetTickCount64(); }
+    if (slot_closed_ms) {
+        if (GetTickCount64() - slot_closed_ms < 250) return 1;
+        slot_closed_ms = 0; return 2; /* drop the answering button latch */
+    }
     if (s_menu_open) return 1;                   /* v194: the settings menu owns the pad */
     if (s_tr_open) return 1;                     /* F10 trainer page owns the pad */
     if (s_tr_close_ms && GetTickCount64() - s_tr_close_ms < 250) return 1;
@@ -508,10 +517,11 @@ typedef struct { const char* key; const char* label; int restart; int n; const c
 static MItem s_mi[] = {
     { "FULLSCREEN",      "Display Mode",       0, 2, { "0", "1" }, { "Windowed", "Fullscreen" } },
     { "PRESENT_VSYNC",   "VSync",              0, 2, { "0", "1" }, { "Off", "On" } },
-    { "UI_FPS_CAP",      "Frame Rate Limit",   0, 6, { "0", "60", "50", "45", "40", "30" }, { "Off", "60 FPS", "50 FPS", "45 FPS", "40 FPS", "30 FPS" } },   /* v209b: Auto removed */
+    { "UI_FPS_CAP",      "Frame Rate Limit",   0, 9, { "0", "30", "40", "45", "50", "60", "120", "144", "240" }, { "Off", "30 FPS", "40 FPS", "45 FPS", "50 FPS", "60 FPS", "120 FPS", "144 FPS", "240 FPS" } },   /* v209b: Auto removed */
     { "KBM_GLYPHS",      "Button Prompts",     0, 6, { "1", "0", "2", "3", "4", "5" }, { "Automatic", "PlayStation", "Keyboard & Mouse", "Xbox", "Nintendo", "Steam Deck" } },
     { "PAD_MOUSE_SPEED", "Mouse Speed",        0, 5, { "900", "650", "450", "325", "225" }, { "1 (Slow)", "2", "3", "4", "5 (Fast)" } },
-    { "RES_SCALE",       "Resolution",         1, 5, { "1", "1.5", "2", "2.5", "3" }, { "720p", "1080p", "1440p", "1800p", "2160p (4K)" } },
+    { "WINDOW_SIZE",     "Window Size",        1, 3, { "auto", "720p", "1080p" }, { "Match Game Resolution", "720p (1280 x 720)", "1080p (1920 x 1080)" } },
+    { "RES_SCALE",       "Game Resolution",         1, 5, { "1", "1.5", "2", "2.5", "3" }, { "720p", "1080p", "1440p", "1800p", "2160p (4K)" } },
     { "SHADOWS",         "Shadows",            1, 2, { "1", "0" }, { "On", "Off" } },
     { "TEX_ANISO",       "Texture Filtering",  1, 5, { "-1", "0", "4", "8", "16" }, { "Game Default", "Bilinear", "4x Anisotropic", "8x Anisotropic", "16x Anisotropic" } },
     { "TEX_MIPS",        "Mipmaps",            1, 2, { "1", "0" }, { "On", "Off" } },

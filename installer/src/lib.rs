@@ -13,3 +13,5 @@ pub mod toml;
 pub mod toolchain;
 pub mod update;
 pub mod util;
+
+pub mod save_manager;

@@ -266,6 +266,9 @@ typedef struct CellSaveDataSetBuf {
  * Functions
  * -----------------------------------------------------------------------*/
 
+/* Optional host reader (PAD_UI_* bits) for the explicit manual save selector. */
+void cellSaveData_set_slot_input(unsigned (*reader)(void));
+
 /* pre-3.00 entry points; forwarders to the "2" forms with userdata = NULL. */
 s32 cellSaveDataListSave(u32 version, CellSaveDataSetList* setList,
                          CellSaveDataSetBuf* setBuf, CellSaveDataListCallback funcList,

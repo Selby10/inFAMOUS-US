@@ -74,3 +74,6 @@ __pycache__/
 installer/launch.txt
 infamous-recomp/*.hlsl
 infamous-recomp/controls.ini
+
+**/user-backups/
+**/.restore-*/

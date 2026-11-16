@@ -1367,6 +1367,8 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
+#include "rsx_window_size.h"
+
 static HWND create_window(u32 width, u32 height, const char* title)
 {
     WNDCLASSEXA wc = {0};
@@ -1536,6 +1538,7 @@ static int init_d3d12(u32 width, u32 height)
 
     /* Create swap chain */
     DXGI_SWAP_CHAIN_DESC1 sc_desc = {0};
+    sc_desc.Scaling = DXGI_SCALING_STRETCH; /* window size does not change render resolution */
     sc_desc.Width = BBW;     /* v154 */
     sc_desc.Height = BBH;
     sc_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -15988,7 +15991,11 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
         snprintf(g_rsx_title_base, sizeof(g_rsx_title_base), "%s",
                  title ? title : "ps3recomp");
     }
-    s_d3d.hwnd = create_window(BBW, BBH, title);   /* v154: window at the internal resolution (clamped to the screen) */
+    u32 window_w, window_h;
+    rsx_window_dimensions(getenv("WINDOW_SIZE"), BBW, BBH, &window_w, &window_h);
+    s_d3d.hwnd = create_window(window_w, window_h, title);
+    fprintf(stderr, "[WINDOW] requested %ux%u, render/output buffers %ux%u (desktop fit applied)\n",
+            window_w, window_h, BBW, BBH);
     {   /* v153: raw mouse input for mouse-look (PAD_RAWINPUT=0 = cursor deltas as before) */
         const char* e = getenv("PAD_RAWINPUT");
         if (s_d3d.hwnd && !(e && e[0] == '0')) {

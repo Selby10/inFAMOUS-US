@@ -10,14 +10,25 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 #![cfg_attr(not(windows), allow(dead_code))]
 
+use infamous_installer::save_manager::{GameLock, Manager, Scope};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-#[cfg_attr(not(windows), allow(dead_code))]
-const REPO_URL: &str = "https://github.com/whompay/inFAMOUSreborn";
-#[cfg_attr(not(windows), allow(dead_code))]
-const REPO_TEXT: &str = "github.com/whompay/inFAMOUSreborn";
+const CREDITS: [(&str, &str); 3] = [
+    (
+        "US ISO (BCUS98119) - WoofahRayetCode / inFAMOUS-US",
+        "https://github.com/WoofahRayetCode/inFAMOUS-US",
+    ),
+    (
+        "Original EU ISO (BCES00220) - Whompay / inFAMOUSreborn",
+        "https://github.com/whompay/inFAMOUSreborn",
+    ),
+    (
+        "Recompiler foundation - sp00nznet / ps3recomp",
+        "https://github.com/sp00nznet/ps3recomp",
+    ),
+];
 
 // ---- launch.txt ------------------------------------------------------------------------------
 
@@ -53,6 +64,7 @@ fn resolve(root: &Path, p: &str) -> PathBuf {
     }
 }
 
+#[derive(Clone)]
 struct Launch {
     root: PathBuf,
     exe: PathBuf,
@@ -161,6 +173,19 @@ impl Launch {
     }
 
     /// `settings.ini` lives in the game's working folder (the in-game menu writes it there too).
+    fn save_manager(&self) -> Manager {
+        let saves = self
+            .env_value("SAVEDATA_ROOT")
+            .filter(|p| !p.is_empty())
+            .map(|p| resolve(&self.cwd, &p))
+            .unwrap_or_else(|| self.cwd.join("gamedata/dev_hdd0/home/00000001/savedata"));
+        Manager {
+            saves,
+            settings: self.settings_path(),
+            backups: self.cwd.join("user-backups"),
+        }
+    }
+
     fn settings_path(&self) -> PathBuf {
         self.cwd.join("settings.ini")
     }
@@ -230,9 +255,21 @@ const DISPLAY: &[Row] = &[
         fallback: 0,
     },
     Row {
+        key: "WINDOW_SIZE",
+        label: "Window Size",
+        hint: "Windowed mode only. Larger windows fit your desktop. Changes need a restart.",
+        vals: &["auto", "720p", "1080p"],
+        names: &[
+            "Match Game Resolution",
+            "720p (1280 x 720)",
+            "1080p (1920 x 1080)",
+        ],
+        fallback: 0,
+    },
+    Row {
         key: "RES_SCALE",
-        label: "Resolution",
-        hint: "Internal rendering resolution.",
+        label: "Game Resolution",
+        hint: "Rendering quality, independent of Window Size. Use 720p for a lighter GPU load.",
         vals: &["1", "1.5", "2", "2.5", "3"],
         names: &["720p", "1080p", "1440p", "1800p", "2160p (4K)"],
         fallback: 1,
@@ -249,9 +286,12 @@ const DISPLAY: &[Row] = &[
         key: "UI_FPS_CAP",
         label: "Frame Rate Limit",
         hint: "Upper limit for the frame rate.",
-        vals: &["0", "60", "50", "45", "40", "30"],
-        names: &["Off", "60 FPS", "50 FPS", "45 FPS", "40 FPS", "30 FPS"],
-        fallback: 1,
+        vals: &["0", "30", "40", "45", "50", "60", "120", "144", "240"],
+        names: &[
+            "Off", "30 FPS", "40 FPS", "45 FPS", "50 FPS", "60 FPS", "120 FPS", "144 FPS",
+            "240 FPS",
+        ],
+        fallback: 5,
     },
 ];
 
@@ -426,6 +466,7 @@ const INI_ORDER: &[&str] = &[
     "UI_FPS_CAP",
     "KBM_GLYPHS",
     "PAD_MOUSE_SPEED",
+    "WINDOW_SIZE",
     "RES_SCALE",
     "SHADOWS",
     "TEX_ANISO",
@@ -565,6 +606,12 @@ struct State {
 }
 
 impl State {
+    fn new_for_restore(old: &Self) -> Self {
+        let mut state = Self::new(old.launch.clone());
+        state.features = old.features;
+        state.sync_rows();
+        state
+    }
     fn new(launch: Launch) -> Self {
         let ini = std::fs::read_to_string(launch.settings_path())
             .map(|t| {
@@ -713,7 +760,8 @@ mod win {
     };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::Controls::{
-        InitCommonControlsEx, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX,
+        InitCommonControlsEx, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES, INITCOMMONCONTROLSEX, NMHDR,
+        TCIF_TEXT, TCITEMW, TCM_GETCURSEL, TCM_INSERTITEMW, TCN_SELCHANGE,
     };
     use windows_sys::Win32::UI::HiDpi::{
         AdjustWindowRectExForDpi, GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
@@ -737,6 +785,16 @@ mod win {
     const ID_RESTORE: usize = 10;
     const ID_SAVE: usize = 11;
     const ID_COMBO0: usize = 100;
+    const ID_TABS: usize = 20;
+    const ID_REFRESH: usize = 21;
+    const ID_OPEN_SAVES: usize = 22;
+    const ID_BACKUP_SAVES: usize = 23;
+    const ID_BACKUP_SETTINGS: usize = 24;
+    const ID_BACKUP_ALL: usize = 25;
+    const ID_OPEN_BACKUPS: usize = 26;
+    const ID_RESTORE_BACKUP: usize = 27;
+    const ID_BACKUPS: usize = 28;
+    const ID_SCOPE: usize = 29;
 
     // Layout at 96 dpi (100 %); everything is scaled by the window's dpi.
     const CW: i32 = 420; // client width
@@ -829,9 +887,16 @@ mod win {
         btn_save: HWND,
         btn_play: HWND,
         link: RECT,
-        link_w: i32,
-        link_hot: bool,
+        link_w: [i32; 3],
+        link_hot: Option<usize>,
         played: bool,
+        tabs: HWND,
+        saves_tab: bool,
+        save_controls: Vec<HWND>,
+        save_details: HWND,
+        backup_combo: HWND,
+        scope_combo: HWND,
+        backup_names: Vec<String>,
     }
 
     thread_local! {
@@ -944,11 +1009,47 @@ mod win {
             let s = move |v| scale(v, dpi);
             let cw = s(CW);
             let mut y = s(M) + s(BANNER_H) + s(M);
+            unsafe {
+                SetWindowPos(
+                    self.tabs,
+                    std::ptr::null_mut(),
+                    s(M),
+                    y,
+                    cw - s(M) * 2,
+                    s(28),
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            y += s(32);
             let list_top = y;
             y += s(LIST_PAD);
+            for c in &self.combos {
+                unsafe {
+                    ShowWindow(c.hwnd, if self.saves_tab { SW_HIDE } else { SW_SHOW });
+                }
+            }
+            for c in &self.save_controls {
+                unsafe {
+                    ShowWindow(*c, if self.saves_tab { SW_SHOW } else { SW_HIDE });
+                }
+            }
+            unsafe {
+                ShowWindow(
+                    self.btn_restore,
+                    if self.saves_tab { SW_HIDE } else { SW_SHOW },
+                );
+                ShowWindow(
+                    self.btn_save,
+                    if self.saves_tab { SW_HIDE } else { SW_SHOW },
+                );
+            }
             self.labels.clear();
             self.seps.clear();
-            let groups = self.state.groups();
+            let groups = if self.saves_tab {
+                Vec::new()
+            } else {
+                self.state.groups()
+            };
             let n = groups.len();
             let mut ci = 0;
             let combo_w = s(COMBO_W);
@@ -987,6 +1088,30 @@ mod win {
                     y += s(SEP_H);
                 }
             }
+
+            if self.saves_tab {
+                for (i, h) in self.save_controls.iter().enumerate() {
+                    let height = if i == 0 {
+                        s(120)
+                    } else if i == 1 || i == 3 {
+                        s(19)
+                    } else {
+                        s(27)
+                    };
+                    unsafe {
+                        SetWindowPos(
+                            *h,
+                            std::ptr::null_mut(),
+                            s(M) + s(8),
+                            y,
+                            cw - s(M) * 2 - s(16),
+                            if i == 2 || i == 4 { s(260) } else { height },
+                            SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                    }
+                    y += height + s(4);
+                }
+            }
             y += s(LIST_PAD);
             self.list = RECT {
                 left: s(M),
@@ -1018,20 +1143,22 @@ mod win {
                 left: 0,
                 top: y,
                 right: cw,
-                bottom: y + s(LINK_H),
+                bottom: y + s(LINK_H) * CREDITS.len() as i32,
             };
             // SAFETY: measuring text on the window's DC, released right after.
             unsafe {
                 let dc = GetDC(self.hwnd);
                 let old = SelectObject(dc, self.fonts.link as _);
-                let t: Vec<u16> = REPO_TEXT.encode_utf16().collect();
-                let mut sz = SIZE { cx: 0, cy: 0 };
-                GetTextExtentPoint32W(dc, t.as_ptr(), t.len() as i32, &mut sz);
+                for (i, (label, _)) in CREDITS.iter().enumerate() {
+                    let t: Vec<u16> = label.encode_utf16().collect();
+                    let mut sz = SIZE { cx: 0, cy: 0 };
+                    GetTextExtentPoint32W(dc, t.as_ptr(), t.len() as i32, &mut sz);
+                    self.link_w[i] = sz.cx;
+                }
                 SelectObject(dc, old);
                 ReleaseDC(self.hwnd, dc);
-                self.link_w = sz.cx;
             }
-            y += s(LINK_H) + s(6);
+            y += s(LINK_H) * CREDITS.len() as i32 + s(6);
             let ch = y;
 
             // window size from client size
@@ -1073,13 +1200,20 @@ mod win {
 
         fn set_fonts(&mut self) {
             let old = std::mem::replace(&mut self.fonts, Fonts::new(self.dpi));
-            for h in self.combos.iter().map(|c| c.hwnd).chain([
-                self.btn_restore,
-                self.btn_save,
-                self.btn_play,
-            ]) {
+            for h in self
+                .combos
+                .iter()
+                .map(|c| c.hwnd)
+                .chain([self.btn_restore, self.btn_save, self.btn_play, self.tabs])
+                .chain(self.save_controls.iter().copied())
+            {
                 // SAFETY: our child windows; redraw with the new font.
                 unsafe { SendMessageW(h, WM_SETFONT, self.fonts.ui as WPARAM, 1) };
+            }
+            for h in self.save_controls.iter().copied().chain([self.tabs]) {
+                unsafe {
+                    SendMessageW(h, WM_SETFONT, self.fonts.ui as WPARAM, 1);
+                }
             }
             old.free();
         }
@@ -1111,7 +1245,7 @@ mod win {
                 fill(&banner, C_BANNER);
                 frame(&banner, C_BANNER_EDGE);
                 let old_font = SelectObject(dc, self.fonts.title as _);
-                let words = ["INFAMOUS", "REBORN"];
+                let words = ["INFAMOUS", "US"];
                 let track = s(7);
                 let gap = s(14);
                 let mut glyphs: Vec<(Vec<u16>, i32, i32)> = Vec::new(); // (char, width, extra gap before)
@@ -1196,40 +1330,250 @@ mod win {
                     );
                 }
 
-                // ---- official source link
-                SelectObject(
-                    dc,
-                    if self.link_hot {
-                        self.fonts.link_hot
-                    } else {
-                        self.fonts.link
-                    } as _,
-                );
-                SetTextColor(dc, if self.link_hot { C_LINK_HOT } else { C_LINK });
-                let t = w(REPO_TEXT);
-                let mut r = self.link;
-                DrawTextW(
-                    dc,
-                    t.as_ptr(),
-                    -1,
-                    &mut r,
-                    DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX,
-                );
+                // Credits are visible on both Settings and Saves, each with its own repo link.
+                for (i, (label, _)) in CREDITS.iter().enumerate() {
+                    let hot = self.link_hot == Some(i);
+                    SelectObject(
+                        dc,
+                        if hot {
+                            self.fonts.link_hot
+                        } else {
+                            self.fonts.link
+                        } as _,
+                    );
+                    SetTextColor(dc, if hot { C_LINK_HOT } else { C_LINK });
+                    let t = w(label);
+                    let mut r = self.link;
+                    r.top += s(LINK_H) * i as i32;
+                    r.bottom = r.top + s(LINK_H);
+                    DrawTextW(
+                        dc,
+                        t.as_ptr(),
+                        -1,
+                        &mut r,
+                        DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX,
+                    );
+                }
                 SelectObject(dc, old_font);
             }
         }
 
-        /// Clickable part of the link line (just the text).
-        fn link_hit(&self, x: i32, y: i32) -> bool {
-            let text_w = self.link_w;
+        /// Hit-test each credit separately so it opens the matching project.
+        fn link_hit(&self, x: i32, y: i32) -> Option<usize> {
+            if y < self.link.top || y >= self.link.bottom {
+                return None;
+            }
+            let row = ((y - self.link.top) / self.s(LINK_H)) as usize;
+            let text_w = *self.link_w.get(row)?;
             let cx = (self.link.left + self.link.right) / 2;
-            y >= self.link.top
-                && y < self.link.bottom
-                && x >= cx - text_w / 2
-                && x < cx + text_w / 2
+            (x >= cx - text_w / 2 && x < cx + text_w / 2).then_some(row)
         }
 
+        fn make_save_controls(&mut self) {
+            self.save_details = self.child(
+                "EDIT",
+                "",
+                ES_MULTILINE as u32
+                    | ES_READONLY as u32
+                    | ES_AUTOVSCROLL as u32
+                    | WS_VSCROLL
+                    | WS_BORDER,
+                30,
+            );
+            self.save_controls.push(self.save_details);
+            let label = self.child("STATIC", "Backup to restore", 0, 31);
+            self.save_controls.push(label);
+            self.backup_combo = self.child(
+                "COMBOBOX",
+                "",
+                CBS_DROPDOWNLIST as u32 | WS_VSCROLL,
+                ID_BACKUPS,
+            );
+            self.save_controls.push(self.backup_combo);
+            let label = self.child("STATIC", "Restore contents", 0, 32);
+            self.save_controls.push(label);
+            self.scope_combo = self.child("COMBOBOX", "", CBS_DROPDOWNLIST as u32, ID_SCOPE);
+            self.save_controls.push(self.scope_combo);
+            for name in ["Saves only", "Settings only", "Saves and settings"] {
+                let text = w(name);
+                unsafe {
+                    SendMessageW(self.scope_combo, CB_ADDSTRING, 0, text.as_ptr() as LPARAM);
+                }
+            }
+            unsafe {
+                SendMessageW(self.scope_combo, CB_SETCURSEL, 0, 0);
+            }
+            for (name, id) in [
+                ("Refresh saves and backups", ID_REFRESH),
+                ("Open Save Folder", ID_OPEN_SAVES),
+                ("Back Up Saves", ID_BACKUP_SAVES),
+                ("Back Up Settings", ID_BACKUP_SETTINGS),
+                ("Back Up Everything", ID_BACKUP_ALL),
+                ("Open Backup Folder", ID_OPEN_BACKUPS),
+                ("Restore Selected Backup...", ID_RESTORE_BACKUP),
+            ] {
+                let h = self.child("BUTTON", name, BS_PUSHBUTTON as u32, id);
+                self.save_controls.push(h);
+            }
+            self.refresh_saves();
+        }
+        fn refresh_saves(&mut self) {
+            let manager = self.state.launch.save_manager();
+            let text = match manager.list_saves() {
+                Ok(entries) => format!(
+                    "Save folder: {}\r\n\r\n{}",
+                    manager.saves.display(),
+                    if entries.is_empty() {
+                        "No inFamous saves found.".into()
+                    } else {
+                        entries
+                            .iter()
+                            .map(|s| format!("{} | {}", s.name, s.modified))
+                            .collect::<Vec<_>>()
+                            .join("\r\n")
+                    }
+                ),
+                Err(e) => format!("Cannot read saves: {e}"),
+            };
+            let text = w(&text);
+            unsafe {
+                SetWindowTextW(self.save_details, text.as_ptr());
+                SendMessageW(self.backup_combo, CB_RESETCONTENT, 0, 0);
+            }
+            self.backup_names.clear();
+            match manager.list_backups() {
+                Ok(entries) => {
+                    for entry in entries {
+                        let text = w(&format!("{} | {}", entry.modified, entry.name));
+                        unsafe {
+                            SendMessageW(
+                                self.backup_combo,
+                                CB_ADDSTRING,
+                                0,
+                                text.as_ptr() as LPARAM,
+                            );
+                        }
+                        self.backup_names.push(entry.name);
+                    }
+                }
+                Err(e) => {
+                    let text = w(&format!("Cannot read backups: {e}"));
+                    unsafe {
+                        SendMessageW(self.backup_combo, CB_ADDSTRING, 0, text.as_ptr() as LPARAM);
+                    }
+                }
+            }
+            if self.backup_names.is_empty() {
+                let text = w("No backups yet");
+                unsafe {
+                    SendMessageW(self.backup_combo, CB_ADDSTRING, 0, text.as_ptr() as LPARAM);
+                }
+            }
+            unsafe {
+                SendMessageW(self.backup_combo, CB_SETCURSEL, 0, 0);
+            }
+        }
+        fn save_action(&mut self, id: usize) -> Result<(), String> {
+            let manager = self.state.launch.save_manager();
+            if id == ID_REFRESH {
+                self.refresh_saves();
+                return Ok(());
+            }
+            if id == ID_OPEN_SAVES || id == ID_OPEN_BACKUPS {
+                let path = if id == ID_OPEN_SAVES {
+                    &manager.saves
+                } else {
+                    &manager.backups
+                };
+                std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
+                let op = w("open");
+                let path = w(&path.to_string_lossy());
+                let result = unsafe {
+                    ShellExecuteW(
+                        self.hwnd,
+                        op.as_ptr(),
+                        path.as_ptr(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        SW_SHOWNORMAL,
+                    )
+                };
+                if result as isize <= 32 {
+                    return Err("Could not open folder".into());
+                }
+                return Ok(());
+            }
+            if self.state.dirty() && (id == ID_BACKUP_SETTINGS || id == ID_BACKUP_ALL) {
+                return Err("Save pending Settings changes before backing them up.".into());
+            }
+            let _lock = GameLock::acquire().map_err(|e| e.to_string())?;
+            let result = if id == ID_RESTORE_BACKUP {
+                if self.state.dirty() {
+                    return Err(
+                        "Save or reset pending settings changes before restoring a backup.".into(),
+                    );
+                }
+                let index = unsafe { SendMessageW(self.backup_combo, CB_GETCURSEL, 0, 0) };
+                let name = self
+                    .backup_names
+                    .get(index as usize)
+                    .ok_or("Select a backup first")?;
+                let scope = match unsafe { SendMessageW(self.scope_combo, CB_GETCURSEL, 0, 0) } {
+                    1 => Scope::Settings,
+                    2 => Scope::Both,
+                    _ => Scope::Saves,
+                };
+                let scope_name = match scope {
+                    Scope::Saves => "saves only",
+                    Scope::Settings => "settings only",
+                    Scope::Both => "saves and settings",
+                };
+                let text=w(&format!("Restore {scope_name} from {name}? A recovery backup will be created first. Other saves will be kept."));
+                let caption = w("Restore backup");
+                if unsafe {
+                    MessageBoxW(
+                        self.hwnd,
+                        text.as_ptr(),
+                        caption.as_ptr(),
+                        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+                    )
+                } != IDYES
+                {
+                    return Ok(());
+                }
+                let recovery = manager.restore(name, scope).map_err(|e| e.to_string())?;
+                self.state = State::new_for_restore(&self.state);
+                self.refresh_values();
+                format!("Restore complete. Recovery backup: {}", recovery.display())
+            } else {
+                let scope = match id {
+                    ID_BACKUP_SAVES => Scope::Saves,
+                    ID_BACKUP_SETTINGS => Scope::Settings,
+                    _ => Scope::Both,
+                };
+                let path = manager.backup(scope).map_err(|e| e.to_string())?;
+                format!("Backup complete: {}", path.display())
+            };
+            self.refresh_saves();
+            let text = w(&result);
+            let caption = w("Saves and settings");
+            unsafe {
+                MessageBoxW(
+                    self.hwnd,
+                    text.as_ptr(),
+                    caption.as_ptr(),
+                    MB_OK | MB_ICONINFORMATION,
+                );
+            }
+            Ok(())
+        }
         fn command(&mut self, id: usize, code: u32) -> After {
+            if (ID_REFRESH..=ID_RESTORE_BACKUP).contains(&id) && code == BN_CLICKED_ {
+                return match self.save_action(id) {
+                    Ok(()) => After::Nothing,
+                    Err(e) => After::Fail(e),
+                };
+            }
             match id {
                 ID_PLAY if code == BN_CLICKED_ => match self.state.play() {
                     Ok(()) => {
@@ -1266,6 +1610,10 @@ mod win {
                 _ => After::Nothing,
             }
         }
+    }
+
+    fn text_item(item: &TCITEMW) -> LPARAM {
+        item as *const TCITEMW as LPARAM
     }
 
     fn lo(v: usize) -> u32 {
@@ -1329,20 +1677,20 @@ mod win {
                     Some((0, After::Nothing))
                 }
                 WM_MOUSELEAVE_ => {
-                    if app.link_hot {
-                        app.link_hot = false;
+                    if app.link_hot.is_some() {
+                        app.link_hot = None;
                         InvalidateRect(hwnd, &app.link, 0);
                     }
                     Some((0, After::Nothing))
                 }
-                WM_SETCURSOR if app.link_hot && lo(lp as usize) == HTCLIENT => {
+                WM_SETCURSOR if app.link_hot.is_some() && lo(lp as usize) == HTCLIENT => {
                     SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_HAND));
                     Some((1, After::Nothing))
                 }
                 WM_LBUTTONUP => {
                     let (x, y) = mouse_xy(lp);
-                    if app.link_hit(x, y) {
-                        let (op, url) = (w("open"), w(REPO_URL));
+                    if let Some(index) = app.link_hit(x, y) {
+                        let (op, url) = (w("open"), w(CREDITS[index].1));
                         ShellExecuteW(
                             hwnd,
                             op.as_ptr(),
@@ -1351,6 +1699,17 @@ mod win {
                             std::ptr::null(),
                             SW_SHOWNORMAL,
                         );
+                    }
+                    Some((0, After::Nothing))
+                }
+                WM_NOTIFY => {
+                    let header = &*(lp as *const NMHDR);
+                    if header.idFrom == ID_TABS && header.code == TCN_SELCHANGE {
+                        app.saves_tab = SendMessageW(app.tabs, TCM_GETCURSEL, 0, 0) == 1;
+                        if app.saves_tab {
+                            app.refresh_saves();
+                        }
+                        app.layout(None);
                     }
                     Some((0, After::Nothing))
                 }
@@ -1420,7 +1779,7 @@ mod win {
             }
             let icc = INITCOMMONCONTROLSEX {
                 dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-                dwICC: ICC_STANDARD_CLASSES,
+                dwICC: ICC_STANDARD_CLASSES | ICC_TAB_CLASSES,
             };
             InitCommonControlsEx(&icc);
         }
@@ -1470,7 +1829,7 @@ mod win {
                 hIconSm: make_icon(16),
             };
             RegisterClassExW(&wc);
-            let title = w("inFamous Reborn - Options");
+            let title = w("inFamous US - Settings and Save Manager");
             let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
             let hwnd = CreateWindowExW(
                 WS_EX_CONTROLPARENT,
@@ -1528,9 +1887,16 @@ mod win {
                     right: 0,
                     bottom: 0,
                 },
-                link_w: 0,
-                link_hot: false,
+                link_w: [0; 3],
+                link_hot: None,
                 played: false,
+                tabs: std::ptr::null_mut(),
+                saves_tab: false,
+                save_controls: Vec::new(),
+                save_details: std::ptr::null_mut(),
+                backup_combo: std::ptr::null_mut(),
+                scope_combo: std::ptr::null_mut(),
+                backup_names: Vec::new(),
             };
             app.btn_restore = app.child(
                 "BUTTON",
@@ -1540,7 +1906,16 @@ mod win {
             );
             app.btn_save = app.child("BUTTON", "Save", BS_PUSHBUTTON as u32, ID_SAVE);
             app.btn_play = app.child("BUTTON", "Play", BS_DEFPUSHBUTTON as u32, ID_PLAY);
+            app.tabs = app.child("SysTabControl32", "", 0, ID_TABS);
+            for (index, name) in ["Settings", "Saves"].iter().enumerate() {
+                let mut text = w(name);
+                let mut item: TCITEMW = std::mem::zeroed();
+                item.mask = TCIF_TEXT;
+                item.pszText = text.as_mut_ptr();
+                SendMessageW(app.tabs, TCM_INSERTITEMW, index, text_item(&item));
+            }
             app.build_combos();
+            app.make_save_controls();
             app.layout(None);
             app.refresh_save();
 

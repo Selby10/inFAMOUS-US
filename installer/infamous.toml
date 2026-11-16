@@ -289,6 +289,7 @@ env = { RD_SPU_INTERP = "1", INFAMOUS_BINK_COMPLETION = "1", PS3_VERBOSE = "0", 
 
 [export]
 exclude = [
+  "infamous-recomp/user-backups/", "infamous-recomp/.restore-*/",
   "**/*.pkg", "**/*.rap", "**/*.rifkey", "**/*.edat", "**/*.edat.dec", "**/*.dkey", "**/*.iso",
   # the game itself, and dumps of its memory
   "Infamous (US)/",
