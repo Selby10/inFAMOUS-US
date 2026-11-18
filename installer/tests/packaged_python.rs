@@ -27,11 +27,15 @@ fn packaged_python_runs_offline() {
     let output = String::from_utf8_lossy(&doctor.stdout);
     let python = python_bundle::prepare(&root, (3, 10)).unwrap();
     // Compiler availability is independent of the Python check.
-    let reported = output.replace('\\', "/");
-    assert!(
-        reported.lines().any(|line| line.contains("OK  Python")
-            && line.contains(&python.to_string_lossy().replace('\\', "/"))),
-        "{output}"
+    let reported = output.lines().find_map(|line| {
+        let version_path = line.trim().strip_prefix("OK  Python ")?;
+        let (_, path) = version_path.split_once(" (")?;
+        path.strip_suffix(')')
+    });
+    let reported = reported.unwrap_or_else(|| panic!("{output}"));
+    assert_eq!(
+        fs::canonicalize(reported).unwrap(),
+        fs::canonicalize(&python).unwrap()
     );
 
     let status = Command::new(&python)
