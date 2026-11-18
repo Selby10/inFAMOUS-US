@@ -939,13 +939,15 @@ mod tests {
 #[cfg(test)]
 mod manifest_tests {
     #[test]
-    fn export_retains_regional_profiles_but_not_game_or_license_files() {
+    fn export_retains_required_build_inputs_but_excludes_private_files() {
         let m = shipped_manifest();
         let root =
             std::env::temp_dir().join(format!("infamous-export-policy-{}", std::process::id()));
         let keep = [
             "installer/pgo/infamous.profdata",
             "installer/pgo/infamous-us.profdata",
+            "ps3recomp/libs/system/savedata_slots.h",
+            "ps3recomp/libs/system/savedata_slot_dialog.h",
         ];
         let private = [
             "infamous-recomp/shadercache-before-test/cache.dat",
@@ -957,6 +959,7 @@ mod manifest_tests {
             "dlc/test.edat.dec",
             "disc/game.dkey",
             "disc/game.iso",
+            "user/savedata-backup/BCUS98119/STATE",
             "infamous-recomp/recompiled/game.cpp",
         ];
         for path in keep.iter().chain(private.iter()) {

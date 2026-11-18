@@ -72,11 +72,8 @@ pub fn refresh_path() {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Check {
-    Unknown,
-    Checking,
     Ok(String),
     Missing(String),
-    Installing(String),
 }
 
 pub fn check_python() -> Check {
@@ -248,7 +245,8 @@ pub fn install_build_tools(log: &(dyn Fn(String) + Sync)) -> Result<(), String> 
         let mut args = vec![
             "modify".to_string(),
             "--installPath".into(),
-            util::path_str(&vs),
+            // Start-Process joins ArgumentList into a command line. Preserve spaces in the path.
+            format!("\"{}\"", vs.display()),
         ];
         args.extend(adds);
         args.extend(["--includeRecommended", "--passive", "--norestart"].map(String::from));
@@ -299,7 +297,6 @@ pub fn install_build_tools(log: &(dyn Fn(String) + Sync)) -> Result<(), String> 
         (_, Check::Ok(_)) => Ok(()),
         (Err(e), _) => Err(format!("the Visual Studio installer did not finish ({e})")),
         (Ok(()), Check::Missing(m)) => Err(m),
-        (Ok(()), c) => Err(format!("{c:?}")),
     }
 }
 
@@ -352,29 +349,28 @@ pub fn check_game(src: &GameSource, title_ids: &[String]) -> Result<GameInfo, Ga
     let other = |e: util::Error| GameProblem::Other(e.to_string());
     let (sfo, copy_bytes, encrypted, needs_rpcs3) = match src {
         GameSource::Iso { path, key } => {
-            let key = match key {
-                Some(k) => Some(iso::read_key_file(k).map_err(other)?),
-                None => None,
-            };
-            let mut img = match iso::open_ready(path, key) {
-                Ok(i) => i,
-                Err(e) if e.0.contains("needs its disc key") => return Err(GameProblem::NeedsKey),
-                Err(e) if e.0.contains("does not fit") => return Err(GameProblem::BadKey),
-                Err(e) => return Err(other(e)),
-            };
+            let mut img = open_game_image(path, key.as_deref())?;
             let e = img.find("PS3_GAME/PARAM.SFO").ok_or_else(|| {
                 GameProblem::Other("This is not a PS3 game disc (no PS3_GAME/PARAM.SFO).".into())
             })?;
             let d = img.read_file(&e).map_err(other)?;
             let sfo = game::parse_sfo(&d)
                 .ok_or_else(|| GameProblem::Other("The disc's PARAM.SFO is unreadable.".into()))?;
-            let size = img
-                .files
-                .iter()
-                .filter(|e| !e.path.to_ascii_uppercase().starts_with("PS3_UPDATE/"))
-                .map(|e| e.size)
-                .sum();
-            (sfo, size, img.decrypting, true)
+            let elf = image_executable(&mut img, "EBOOT.elf")?;
+            let needs_rpcs3 = if elf == game::Kind::Elf {
+                false
+            } else {
+                match image_executable(&mut img, "EBOOT.BIN")? {
+                    game::Kind::Elf | game::Kind::DebugSelf => false,
+                    game::Kind::RetailSelf => true,
+                    game::Kind::Unknown => {
+                        return Err(GameProblem::Other(
+                            "The disc image has no usable EBOOT.BIN or EBOOT.elf.".into(),
+                        ));
+                    }
+                }
+            };
+            (sfo, img.total_size(), img.decrypting, needs_rpcs3)
         }
         GameSource::Folder(p) => {
             let g = game::locate(p).map_err(other)?;
@@ -398,6 +394,66 @@ pub fn check_game(src: &GameSource, title_ids: &[String]) -> Result<GameInfo, Ga
         encrypted,
         needs_rpcs3,
     })
+}
+
+fn open_game_image(path: &Path, key: Option<&Path>) -> Result<iso::Iso, GameProblem> {
+    let key = key
+        .map(iso::read_key_file)
+        .transpose()
+        .map_err(|_| GameProblem::BadKey)?;
+    let mut img = iso::open_ready(path, key).map_err(|e| {
+        if e.0.contains("needs its disc key") {
+            GameProblem::NeedsKey
+        } else if e.0.contains("does not fit") {
+            GameProblem::BadKey
+        } else {
+            GameProblem::Other(e.to_string())
+        }
+    })?;
+    img.files
+        .retain(|e| !e.path.to_ascii_uppercase().starts_with("PS3_UPDATE/"));
+    Ok(img)
+}
+
+fn image_executable(img: &mut iso::Iso, name: &str) -> Result<game::Kind, GameProblem> {
+    let Some(entry) = img.find(&format!("PS3_GAME/USRDIR/{name}")) else {
+        return Ok(game::Kind::Unknown);
+    };
+    img.read_head(&entry, 0x40)
+        .map(|h| game::classify_header(&h))
+        .map_err(|e| GameProblem::Other(e.to_string()))
+}
+
+const DISC_MARKER: &str = ".copied-from-disc-image";
+const DISC_PENDING: &str = ".copying-from-disc-image";
+
+fn image_stamp(path: &Path) -> std::io::Result<String> {
+    let path = path.canonicalize()?;
+    let meta = std::fs::metadata(&path)?;
+    Ok(format!("v2|{path:?}|{}|{:?}", meta.len(), meta.modified()?))
+}
+
+fn real_directory(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & 0x400 != 0 {
+            return false;
+        }
+    }
+    meta.file_type().is_dir()
+}
+
+fn cached_image(dest: &Path, stamp: &str, image: &iso::Iso) -> bool {
+    real_directory(dest)
+        && std::fs::read_to_string(dest.join(DISC_MARKER)).is_ok_and(|s| s == stamp)
+        && image.files.iter().all(|entry| {
+            std::fs::metadata(util::join_slash(dest, &entry.path))
+                .is_ok_and(|m| m.is_file() && m.len() == entry.size)
+        })
 }
 
 /// rpcs3.exe in the usual places.
@@ -596,6 +652,8 @@ fn place_files(
 pub struct InstallOpts {
     pub source: Source,
     pub location: PathBuf,
+    pub payload_bytes: u64,
+    pub title_ids: Vec<String>,
     pub game: GameSource,
     pub rpcs3: Option<PathBuf>,
     pub desktop_shortcut: bool,
@@ -871,6 +929,13 @@ fn kill_tree(pid: u32) {
     let _ = Command::new("kill").arg(pid.to_string()).output();
 }
 
+fn remove_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
 fn install(
     o: &InstallOpts,
     p: &Arc<Mutex<Progress>>,
@@ -893,7 +958,76 @@ fn install(
         repaint();
     };
     let stopped = || cancel.load(Ordering::SeqCst);
-    let estr = |e: util::Error| e.to_string();
+    let estr_io = |e: std::io::Error| e.to_string();
+
+    set(0.0, "Checking the game and install location", "");
+    let game_info = check_game(&o.game, &o.title_ids).map_err(|e| e.to_string())?;
+    if game_info.needs_rpcs3 && !o.rpcs3.as_ref().is_some_and(|p| p.is_file()) {
+        return Err("Locate rpcs3.exe on the setup screen to decrypt EBOOT.BIN.".into());
+    }
+    let dest = o.location.join(&o.link_name);
+    let mut disc = match &o.game {
+        GameSource::Iso { path, key } => {
+            if std::fs::symlink_metadata(&dest).is_ok()
+                && (!real_directory(&dest)
+                    || !(dest.join(DISC_MARKER).is_file() || dest.join(DISC_PENDING).is_file()))
+            {
+                return Err(format!(
+                    "{} already contains game files. Choose a new install location or select that game folder as the source.",
+                    dest.display()
+                ));
+            }
+            let stamp = image_stamp(path).map_err(estr_io)?;
+            let image = open_game_image(path, key.as_deref()).map_err(|e| e.to_string())?;
+            let cached = cached_image(&dest, &stamp, &image);
+            Some((path, stamp, image, cached))
+        }
+        GameSource::Folder(_) => None,
+    };
+    let copy_bytes = disc.as_ref().map_or(
+        0,
+        |(_, _, image, cached)| {
+            if *cached {
+                0
+            } else {
+                image.total_size()
+            }
+        },
+    );
+    let need = space_needed(o.payload_bytes, copy_bytes);
+    if let Some(free) = util::free_space(&o.location).filter(|&free| free < need) {
+        return Err(format!(
+            "Setup needs about {}. The install drive has {} free. Free up space or choose another location.",
+            util::human_bytes(need),
+            util::human_bytes(free)
+        ));
+    }
+
+    refresh_path();
+    if stopped() {
+        return Err("cancelled".into());
+    }
+    if let Check::Missing(reason) = check_python() {
+        set(0.0, "Installing Python", "Windows may ask for approval.");
+        log(reason);
+        install_python(&log)
+            .map_err(|e| format!("Python setup failed: {e}. Install Python 3.12 and try again."))?;
+    }
+    if stopped() {
+        return Err("cancelled".into());
+    }
+    if let Check::Missing(reason) = check_build_tools() {
+        set(
+            0.0,
+            "Installing C++ build tools",
+            "Windows may ask for approval. This can take several minutes.",
+        );
+        log(reason);
+        install_build_tools(&log).map_err(|e| format!("C++ tools setup failed: {e}. Complete installation of Visual Studio 2022 C++ Build Tools with Clang and try again."))?;
+    }
+    if stopped() {
+        return Err("cancelled".into());
+    }
 
     // 1. The port's files.
     std::fs::create_dir_all(&o.location)
@@ -919,51 +1053,51 @@ fn install(
     // 2. The game files.
     let game_dir = match &o.game {
         GameSource::Folder(f) => f.clone(),
-        GameSource::Iso { path, key } => {
-            let dest = o.location.join(&o.link_name);
-            let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
-            let stamp = format!("{}|{}", path.display(), meta.len());
-            let marker = dest.join(".copied-from-disc-image");
-            if std::fs::read_to_string(&marker)
-                .map(|s| s == stamp)
-                .unwrap_or(false)
-            {
+        GameSource::Iso { .. } => {
+            let (path, stamp, image, cached) = disc.as_mut().unwrap();
+            if *cached {
                 log("The game files were already copied from this disc image.".into());
             } else {
                 set(0.03, "Copying the game from your disc image", "");
-                let key = match key {
-                    Some(k) => Some(iso::read_key_file(k).map_err(estr)?),
-                    None => None,
-                };
-                let mut img = iso::open_ready(path, key).map_err(estr)?;
-                img.files
-                    .retain(|e| !e.path.to_ascii_uppercase().starts_with("PS3_UPDATE/"));
-                let mut last = 0f32;
-                let mut err = None;
-                img.extract(&dest, &mut |d, t, file| {
-                    let f = d as f32 / t.max(1) as f32;
-                    if f - last > 0.002 || d == t {
-                        last = f;
-                        set(
-                            0.03 + 0.22 * f,
-                            "",
-                            &format!(
-                                "{} of {}  ·  {}",
-                                util::human_bytes(d),
-                                util::human_bytes(t),
-                                file
-                            ),
-                        );
-                    }
-                    if stopped() && err.is_none() {
-                        err = Some(());
-                    }
-                })
-                .map_err(estr)?;
-                if err.is_some() {
-                    return Err("cancelled".into());
+                std::fs::create_dir_all(&dest).map_err(estr_io)?;
+                let marker = dest.join(DISC_MARKER);
+                let pending = dest.join(DISC_PENDING);
+                std::fs::write(&pending, b"").map_err(estr_io)?;
+                remove_if_present(&marker).map_err(estr_io)?;
+                if image.find("PS3_GAME/USRDIR/EBOOT.elf").is_none() {
+                    remove_if_present(&dest.join("PS3_GAME/USRDIR/EBOOT.elf")).map_err(estr_io)?;
                 }
-                std::fs::write(&marker, stamp).map_err(|e| e.to_string())?;
+                let mut last = 0f32;
+                image
+                    .extract_checked(&dest, &mut |done, total, file| {
+                        if stopped() {
+                            return Err(util::Error("cancelled".into()));
+                        }
+                        let fraction = done as f32 / total.max(1) as f32;
+                        if fraction - last > 0.002 || done == total {
+                            last = fraction;
+                            set(
+                                0.03 + 0.22 * fraction,
+                                "",
+                                &format!(
+                                    "{} of {}  |  {}",
+                                    util::human_bytes(done),
+                                    util::human_bytes(total),
+                                    file
+                                ),
+                            );
+                        }
+                        Ok(())
+                    })
+                    .map_err(|e| e.to_string())?;
+                if image_stamp(path).map_err(estr_io)? != *stamp {
+                    return Err(
+                        "The disc image changed during setup. Select the image again and retry."
+                            .into(),
+                    );
+                }
+                std::fs::write(&pending, stamp).map_err(estr_io)?;
+                std::fs::rename(&pending, &marker).map_err(estr_io)?;
                 log(format!("Game files copied to {}", dest.display()));
             }
             dest
@@ -1078,6 +1212,9 @@ fn run_cli(
         .spawn()
         .map_err(|e| format!("could not start {}: {e}", util::show_cmd(&cmd)))?;
     *child.lock().unwrap() = Some(ch.id());
+    if stopped() {
+        kill_tree(ch.id());
+    }
     let (tx, rx) = mpsc::channel::<String>();
     for pipe in [
         ch.stdout

@@ -126,22 +126,25 @@ pub fn classify(path: &Path) -> Result<Kind> {
     let mut h = [0u8; 0x40];
     use std::io::Read;
     let n = f.read(&mut h)?;
-    let h = &h[..n];
+    Ok(classify_header(&h[..n]))
+}
+
+pub(crate) fn classify_header(h: &[u8]) -> Kind {
     if h.starts_with(b"\x7fELF") {
         // ELFCLASS64, big-endian, e_machine 21 (PPC64)
         if h.len() >= 0x14 && h[4] == 2 && h[5] == 2 && u16be(h, 0x12) == Some(21) {
-            return Ok(Kind::Elf);
+            return Kind::Elf;
         }
-        return Ok(Kind::Unknown);
+        return Kind::Unknown;
     }
     if h.starts_with(b"SCE\0") {
-        return Ok(if u16be(h, 8) == Some(0x8000) {
+        return if u16be(h, 8) == Some(0x8000) {
             Kind::DebugSelf
         } else {
             Kind::RetailSelf
-        });
+        };
     }
-    Ok(Kind::Unknown)
+    Kind::Unknown
 }
 
 /// RPCS3's command line decrypter ("--decrypt <path>") writes EBOOT.elf next to EBOOT.BIN.

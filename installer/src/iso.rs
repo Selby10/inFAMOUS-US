@@ -564,6 +564,18 @@ impl Iso {
 
     /// Copy every file to `out` (created), calling `progress(done_bytes, total_bytes)` as it goes.
     pub fn extract(&mut self, out: &Path, progress: &mut dyn FnMut(u64, u64, &str)) -> Result<()> {
+        self.extract_checked(out, &mut |done, total, path| {
+            progress(done, total, path);
+            Ok(())
+        })
+    }
+
+    /// Extract with a callback that can stop the copy before the current file is published.
+    pub(crate) fn extract_checked(
+        &mut self,
+        out: &Path,
+        progress: &mut dyn FnMut(u64, u64, &str) -> Result<()>,
+    ) -> Result<()> {
         let total = self.total_size();
         let mut done = 0u64;
         let files = self.files.clone();
@@ -572,7 +584,9 @@ impl Iso {
         for e in &files {
             let dst = util::join_slash(out, &e.path);
             util::ensure_parent(&dst)?;
-            let tmp = dst.with_extension("partial");
+            let mut tmp = dst.as_os_str().to_os_string();
+            tmp.push(".partial");
+            let tmp = std::path::PathBuf::from(tmp);
             let mut w = std::io::BufWriter::with_capacity(
                 1 << 20,
                 File::create(&tmp).ctx(|| format!("creating {}", tmp.display()))?,
@@ -589,14 +603,11 @@ impl Iso {
                     left -= take as u64;
                     s += n;
                     done += take as u64;
-                    progress(done, total, &e.path);
+                    progress(done, total, &e.path)?;
                 }
             }
             w.flush()?;
             drop(w);
-            if dst.exists() {
-                fs::remove_file(&dst)?;
-            }
             fs::rename(&tmp, &dst)?;
         }
         Ok(())
@@ -607,16 +618,13 @@ impl Iso {
 /// next to the image) and verify it.
 pub fn open_ready(path: &Path, key: Option<[u8; 16]>) -> Result<Iso> {
     let mut iso = Iso::open(path)?;
-    let key = match key {
-        Some(k) => Some(k),
-        None => match find_key_file(path) {
-            Some(p) => Some(read_key_file(&p)?),
-            None => None,
-        },
-    };
     match iso.detect_encryption()? {
         Some(false) => {}
         enc => {
+            let key = match key {
+                Some(k) => Some(k),
+                None => find_key_file(path).map(|p| read_key_file(&p)).transpose()?,
+            };
             let Some(k) = key else {
                 if enc == Some(true) {
                     bail!("this disc image is encrypted (a 1:1 dump); it needs its disc key (.dkey file)");

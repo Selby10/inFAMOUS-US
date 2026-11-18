@@ -147,7 +147,7 @@ impl Payload {
         Ok(out)
     }
 
-    /// Write every file under `dest`; `progress(done_bytes, total_bytes)`.
+    /// Install the payload under `dest`, preserving timestamps of unchanged files.
     pub fn extract(&self, dest: &Path, progress: &mut dyn FnMut(u64, u64)) -> Result<usize> {
         let mut f = File::open(&self.exe)?;
         f.seek(SeekFrom::Start(self.start))?;
@@ -190,15 +190,18 @@ impl Payload {
                 }
                 w.flush()?;
             }
-            if dst.exists() {
-                std::fs::remove_file(&dst).ctx(|| {
+            if std::fs::metadata(&dst).is_ok_and(|m| m.is_file() && m.len() == size)
+                && crate::hash::sha256_file(&dst).ok() == Some(crate::hash::sha256_file(&tmp)?)
+            {
+                std::fs::remove_file(&tmp)?;
+            } else {
+                std::fs::rename(&tmp, &dst).ctx(|| {
                     format!(
                         "replacing {} (is it open in another program?)",
                         dst.display()
                     )
                 })?;
             }
-            std::fs::rename(&tmp, &dst)?;
             done += 4 + pl as u64 + 8 + size;
             n += 1;
             progress(done, self.len);
@@ -240,6 +243,21 @@ mod tests {
         assert_eq!(p.read("a.txt").unwrap().unwrap(), b"hello");
         assert!(p.read("nope").unwrap().is_none());
         assert_eq!(p.names().unwrap(), vec!["a.txt", "x/y/b.bin", "empty"]);
+        let existing = d.join("out/a.txt");
+        let old_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        File::options()
+            .write(true)
+            .open(&existing)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+        std::fs::write(d.join("out/x/y/b.bin"), vec![8u8; 100_000]).unwrap();
+        p.extract(&d.join("out"), &mut |_, _| {}).unwrap();
+        assert_eq!(existing.metadata().unwrap().modified().unwrap(), old_time);
+        assert_eq!(
+            std::fs::read(d.join("out/x/y/b.bin")).unwrap(),
+            vec![7u8; 100_000]
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 }

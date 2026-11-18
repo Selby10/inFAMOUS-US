@@ -76,13 +76,17 @@ those replace the installer and the game's launcher too (a running copy is renam
 
 ## The setup program (what players download)
 
-`inFamous Setup.exe` is a normal Windows installer window: Welcome → Requirements (Python and
-the C++ build tools, with **Install** buttons that use winget) → Your game (pick the **.iso** or a
-game folder; encrypted Redump images work with their `.dkey` next to them) → Install location →
-progress bar → **Play**. It carries the whole publishable tree inside itself, extracts it to the
-chosen folder, copies the game out of the disc image, runs `infamous-installer install` there and
-creates `inFamous.exe` (starts the game without a console) plus desktop/Start-menu shortcuts.
-Running it again on the same folder repairs/updates and only redoes what changed.
+Download the `inFamous-Setup` artifact from a successful **Setup app** workflow run and open
+`inFamous Setup.exe`. Select your own US (`BCUS98119`) or European (`BCES00220`) disc image
+or extracted game folder, then click **Install**. Setup fills in an install location and lets you
+change it or turn off shortcuts on the same screen.
+
+Setup checks the game and free space, installs missing Python and C++ build tools, and builds the
+game on your PC. Windows may ask for approval. If your ISO is encrypted, keep its matching
+`.dkey` next to the ISO or select the key in Setup. If the game executable requires RPCS3 and
+Setup cannot find it, select your local `rpcs3.exe`. When the build finishes, click **Play**.
+Run Setup again with the same game and location to reuse a complete copy of the disc and the
+incremental build. Setup shows details if a step fails so you can correct the issue and retry.
 
 Build it (maintainer, after `make-patches`):
 

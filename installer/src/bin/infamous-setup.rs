@@ -1,10 +1,9 @@
-//! inFamous Setup: the point-and-click installer. Pages: Welcome, Requirements, Your game,
-//! Install location, Installing, Done. The work itself is in `infamous_installer::setup`.
+//! inFamous Setup. Installation runs in the background through infamous_installer::setup.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use eframe::egui::{self, Color32, RichText, Stroke};
 use infamous_installer::{setup, util};
-use setup::{Check, GameInfo, GameProblem, GameSource, Installer, UpdateInfo};
+use setup::{GameInfo, GameProblem, GameSource, Installer, UpdateInfo};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -112,7 +111,6 @@ enum Icon {
     Bad,
     Warn,
     Busy,
-    Dot,
 }
 
 fn icon(ui: &mut egui::Ui, kind: Icon) {
@@ -147,9 +145,6 @@ fn icon(ui: &mut egui::Ui, kind: Icon) {
                 1.5,
                 Color32::from_rgb(0x20, 0x16, 0x00),
             );
-        }
-        Icon::Dot => {
-            p.circle_stroke(c, 9.0, Stroke::new(1.5_f32, MUTED));
         }
     }
 }
@@ -211,19 +206,13 @@ fn window_icon() -> egui::IconData {
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Page {
-    Welcome,
-    Requirements,
     Game,
-    Location,
     Installing,
     Done,
 }
 
-const PAGES: [(Page, &str); 6] = [
-    (Page::Welcome, "Welcome"),
-    (Page::Requirements, "Requirements"),
+const PAGES: [(Page, &str); 3] = [
     (Page::Game, "Your game"),
-    (Page::Location, "Install location"),
     (Page::Installing, "Installing"),
     (Page::Done, "Play"),
 ];
@@ -242,12 +231,6 @@ enum UpdState {
     Done(Result<UpdateInfo, String>),
 }
 
-struct Reqs {
-    python: Check,
-    tools: Check,
-    log: Vec<String>,
-}
-
 struct App {
     page: Page,
     source: Option<setup::Source>,
@@ -259,9 +242,6 @@ struct App {
     update_repo: Option<String>,
     update_branch: String,
     repaint: Arc<dyn Fn() + Send + Sync>,
-
-    reqs: Arc<Mutex<Reqs>>,
-    show_req_log: bool,
 
     game: Option<GameSource>,
     game_state: Arc<Mutex<(u64, GameState)>>,
@@ -275,7 +255,9 @@ struct App {
 
     installer: Option<Installer>,
     show_log: bool,
+    opened_error_log: bool,
     confirm_cancel: bool,
+    launch_error: Option<String>,
 
     /// An existing installation found at the default location (or picked), offered for updating.
     existing: Option<PathBuf>,
@@ -291,7 +273,7 @@ impl App {
         let repaint: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
         let setup_exe = std::env::current_exe().unwrap_or_default();
         let mut app = App {
-            page: Page::Welcome,
+            page: Page::Game,
             source: None,
             payload_bytes: 0,
             load_error: None,
@@ -301,12 +283,6 @@ impl App {
             update_repo: None,
             update_branch: "main".into(),
             repaint,
-            reqs: Arc::new(Mutex::new(Reqs {
-                python: Check::Unknown,
-                tools: Check::Unknown,
-                log: Vec::new(),
-            })),
-            show_req_log: false,
             game: None,
             game_state: Arc::new(Mutex::new((0, GameState::None))),
             game_gen: 0,
@@ -317,7 +293,9 @@ impl App {
             start_menu: true,
             installer: None,
             show_log: false,
+            opened_error_log: false,
             confirm_cancel: false,
+            launch_error: None,
             existing: None,
             upd: Arc::new(Mutex::new((0, UpdState::Checking))),
             upd_gen: 0,
@@ -338,17 +316,13 @@ impl App {
             Err(e) => app.load_error = Some(e),
         }
         app.location = util::path_str(&setup::default_location(&app.title));
-        app.check_reqs();
         let here = PathBuf::from(app.location.clone());
         app.find_existing(here);
         // For screenshots / testing: open on a given page.
         if let Ok(pg) = std::env::var("INFAMOUS_SETUP_PAGE") {
             app.page = match pg.as_str() {
-                "requirements" => Page::Requirements,
-                "game" => Page::Game,
-                "location" => Page::Location,
                 "done" => Page::Done,
-                _ => Page::Welcome,
+                _ => Page::Game,
             };
             if let Ok(g) = std::env::var("INFAMOUS_SETUP_GAME") {
                 let p = PathBuf::from(g);
@@ -406,6 +380,7 @@ impl App {
         self.updating = true;
         self.confirm_cancel = false;
         self.show_log = false;
+        self.opened_error_log = false;
         self.page = Page::Installing;
     }
 
@@ -498,81 +473,6 @@ impl App {
                 }
             }
         }
-        ui.add_space(8.0);
-        ui.label(
-            RichText::new("To install a fresh copy instead, click Next.")
-                .small()
-                .color(MUTED),
-        );
-        ui.add_space(8.0);
-    }
-
-    fn check_reqs(&self) {
-        {
-            let mut r = self.reqs.lock().unwrap();
-            r.python = Check::Checking;
-            r.tools = Check::Checking;
-        }
-        let (reqs, rp) = (self.reqs.clone(), self.repaint.clone());
-        std::thread::spawn(move || {
-            setup::refresh_path();
-            let py = setup::check_python();
-            reqs.lock().unwrap().python = py;
-            rp();
-            let t = setup::check_build_tools();
-            reqs.lock().unwrap().tools = t;
-            rp();
-        });
-    }
-
-    fn install_req(&self, python: bool) {
-        {
-            let mut r = self.reqs.lock().unwrap();
-            let msg = if python {
-                "Installing Python..."
-            } else {
-                "Installing the C++ build tools (a few GB; this can take a while)..."
-            };
-            if python {
-                r.python = Check::Installing(msg.into());
-            } else {
-                r.tools = Check::Installing(msg.into());
-            }
-        }
-        let (reqs, rp) = (self.reqs.clone(), self.repaint.clone());
-        std::thread::spawn(move || {
-            let log = {
-                let reqs = reqs.clone();
-                let rp = rp.clone();
-                move |l: String| {
-                    reqs.lock().unwrap().log.push(l);
-                    rp();
-                }
-            };
-            let r = if python {
-                setup::install_python(&log)
-            } else {
-                setup::install_build_tools(&log)
-            };
-            let state = match r {
-                Ok(()) => {
-                    if python {
-                        setup::check_python()
-                    } else {
-                        setup::check_build_tools()
-                    }
-                }
-                Err(e) => Check::Missing(e),
-            };
-            let mut g = reqs.lock().unwrap();
-            if python {
-                g.python = state;
-            } else {
-                g.tools = state;
-            }
-            drop(g);
-            rp();
-        });
     }
 
     fn set_game(&mut self, src: GameSource) {
@@ -606,32 +506,29 @@ impl App {
         }
     }
 
-    fn can_continue(&self) -> bool {
-        match self.page {
-            Page::Welcome => self.load_error.is_none(),
-            Page::Requirements => {
-                let r = self.reqs.lock().unwrap();
-                matches!(r.python, Check::Ok(_)) && matches!(r.tools, Check::Ok(_))
-            }
-            Page::Game => match self.game_info() {
-                Some(i) => {
-                    !i.needs_rpcs3 || self.rpcs3.as_ref().map(|p| p.is_file()).unwrap_or(false)
-                }
-                None => false,
-            },
-            Page::Location => !self.location.trim().is_empty(),
-            _ => false,
-        }
+    fn can_install(&self) -> bool {
+        self.source.is_some()
+            && !self.location.trim().is_empty()
+            && self
+                .game_info()
+                .is_some_and(|i| !i.needs_rpcs3 || self.rpcs3.as_ref().is_some_and(|p| p.is_file()))
     }
 
     fn start_install(&mut self) {
+        if !self.can_install() {
+            return;
+        }
         let (Some(game), Some(source)) = (self.game.clone(), self.source.clone()) else {
             return;
         };
         let needs = self.game_info().map(|i| i.needs_rpcs3).unwrap_or(true);
+        let location = util::absolute(Path::new(self.location.trim()));
+        self.location = util::path_str(&location);
         let opts = setup::InstallOpts {
             source,
-            location: PathBuf::from(self.location.trim()),
+            location,
+            payload_bytes: self.payload_bytes,
+            title_ids: self.title_ids.clone(),
             game,
             rpcs3: if needs { self.rpcs3.clone() } else { None },
             desktop_shortcut: self.desktop,
@@ -640,6 +537,9 @@ impl App {
             link_name: self.link_name.clone(),
         };
         self.installer = Some(Installer::start(opts, self.repaint.clone()));
+        self.updating = false;
+        self.show_log = false;
+        self.opened_error_log = false;
         self.confirm_cancel = false;
         self.page = Page::Installing;
     }
@@ -657,137 +557,24 @@ impl App {
         ui.add_space(12.0);
     }
 
-    fn page_welcome(&mut self, ui: &mut egui::Ui) {
-        Self::heading(
-            ui,
-            &format!("Welcome to {} for PC", self.title),
-            "This program builds the PC version of the game from your own copy of it.",
-        );
+    fn page_setup(&mut self, ui: &mut egui::Ui) {
         if let Some(e) = &self.load_error {
-            card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    icon(ui, Icon::Bad);
-                    ui.vertical(|ui| ui.label(RichText::new(e).color(BAD)));
-                });
-            });
+            ui.label(RichText::new(e).color(BAD));
             return;
         }
+        self.page_game(ui);
+        ui.add_space(12.0);
+        self.install_options(ui);
         if self.existing.is_some() {
+            ui.add_space(12.0);
             self.update_card(ui);
-        }
-        card(ui, |ui| {
-            ui.label(RichText::new("You will need").strong());
-            for (t, d) in [
-                ("Your game", format!("A disc image (.iso) or game folder of {}, European release ({}).", self.title, self.title_ids.join(", "))),
-                ("Disk space", format!("About {} free.", util::human_bytes(setup::space_needed(self.payload_bytes, 12 << 30)))),
-                ("Time", "The first build takes roughly 20 to 60 minutes, depending on your PC. It runs on its own.".into()),
-            ] {
-                ui.horizontal(|ui| {
-                    icon(ui, Icon::Dot);
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.label(RichText::new(t).strong());
-                        ui.label(RichText::new(d).color(MUTED));
-                    });
-                });
-            }
-        });
-        ui.add_space(6.0);
-        ui.label(RichText::new("No game files are included in this program. Everything is made from your disc on your PC.").small().color(MUTED));
-    }
-
-    fn page_requirements(&mut self, ui: &mut egui::Ui) {
-        Self::heading(
-            ui,
-            "Requirements",
-            "The game is compiled on your PC, so it needs these free tools.",
-        );
-        let (python, tools, nlog) = {
-            let r = self.reqs.lock().unwrap();
-            (r.python.clone(), r.tools.clone(), r.log.len())
-        };
-        let busy = matches!(python, Check::Installing(_)) || matches!(tools, Check::Installing(_));
-        let mut install = None;
-        for (i, (name, what, c)) in [
-            (
-                "Python 3",
-                "Runs the tools that rebuild the game code.",
-                &python,
-            ),
-            (
-                "Visual Studio Build Tools + Clang",
-                "The C++ compiler. A free download from Microsoft (several GB).",
-                &tools,
-            ),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    icon(
-                        ui,
-                        match c {
-                            Check::Ok(_) => Icon::Ok,
-                            Check::Missing(_) => Icon::Bad,
-                            _ => Icon::Busy,
-                        },
-                    );
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 3.0;
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(name).strong());
-                            if let Check::Missing(_) = c {
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui.add_enabled(!busy, primary("Install")).clicked() {
-                                            install = Some(i == 0);
-                                        }
-                                    },
-                                );
-                            }
-                        });
-                        let (txt, col) = match c {
-                            Check::Ok(s) => (s.clone(), MUTED),
-                            Check::Missing(s) => (format!("Not found. {}\n{s}", what), WARN),
-                            Check::Installing(s) => (s.clone(), ACCENT_HI),
-                            Check::Checking | Check::Unknown => ("Checking...".into(), MUTED),
-                        };
-                        ui.label(RichText::new(txt).small().color(col));
-                    });
-                });
-            });
-        }
-        if let Some(py) = install {
-            self.install_req(py);
-        }
-        ui.horizontal(|ui| {
-            if ui.add_enabled(!busy, secondary("Check again")).clicked() {
-                self.check_reqs();
-            }
-            if nlog > 0
-                && ui
-                    .add(secondary(if self.show_req_log {
-                        "Hide details"
-                    } else {
-                        "Show details"
-                    }))
-                    .clicked()
-            {
-                self.show_req_log = !self.show_req_log;
-            }
-        });
-        if self.show_req_log {
-            let log = self.reqs.lock().unwrap().log.join("\n");
-            log_box(ui, &log, 150.0);
         }
     }
 
     fn page_game(&mut self, ui: &mut egui::Ui) {
         Self::heading(
             ui,
-            "Your game",
+            "Set up inFamous",
             &format!(
                 "Choose your {} disc image, or a folder with the game's files.",
                 self.title
@@ -870,7 +657,9 @@ impl App {
                 });
             });
             if let (
-                GameState::Problem(GameProblem::NeedsKey | GameProblem::BadKey),
+                GameState::Problem(
+                    GameProblem::NeedsKey | GameProblem::BadKey | GameProblem::Other(_),
+                ),
                 GameSource::Iso { path, .. },
             ) = (&state, &src)
             {
@@ -932,14 +721,9 @@ impl App {
         }
     }
 
-    fn page_location(&mut self, ui: &mut egui::Ui) {
-        Self::heading(
-            ui,
-            "Install location",
-            "Where should the game be built? Pick a drive with plenty of space.",
-        );
+    fn install_options(&mut self, ui: &mut egui::Ui) {
         card(ui, |ui| {
-            ui.label(RichText::new("Folder").strong());
+            ui.label(RichText::new("Install location").strong());
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.location)
@@ -973,7 +757,7 @@ impl App {
             let (txt, col) = match free {
                 Some(f) if f < need => (
                     format!(
-                        "Needs about {}, but only {} is free on that drive.",
+                        "Fresh setup needs about {}. This drive has {} free.",
                         util::human_bytes(need),
                         util::human_bytes(f)
                     ),
@@ -987,28 +771,43 @@ impl App {
                     ),
                     MUTED,
                 ),
-                None => (format!("Needs about {}", util::human_bytes(need)), MUTED),
+                None => (
+                    format!("Fresh setup needs about {}", util::human_bytes(need)),
+                    MUTED,
+                ),
             };
             ui.label(RichText::new(txt).small().color(col));
-            if self.location.contains(['(', ')', '&', '%', '!', '^']) {
+            if self.location.contains(['&', '%', '!', '^']) {
                 ui.label(
                     RichText::new(
-                        "Tip: a path without ( ) & % ! ^ avoids trouble with the build tools.",
+                        "Tip: a path without & % ! ^ avoids trouble with the build tools.",
                     )
                     .small()
                     .color(WARN),
                 );
             }
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut self.desktop, "Desktop shortcut");
+                ui.checkbox(&mut self.start_menu, "Start menu shortcut");
+            });
         });
-        card(ui, |ui| {
-            ui.checkbox(&mut self.desktop, "Create a desktop shortcut");
-            ui.checkbox(&mut self.start_menu, "Add to the Start menu");
-        });
-        ui.label(RichText::new("When you click Install, the game is copied and compiled. It runs by itself; you can leave it alone.").small().color(MUTED));
+        ui.label(RichText::new("Setup installs missing Python and C++ tools and builds the game locally. Windows may ask for approval.").small().color(MUTED));
     }
 
     fn page_installing(&mut self, ui: &mut egui::Ui) {
         let Some(inst) = &self.installer else { return };
+        if !self.opened_error_log
+            && inst
+                .progress
+                .lock()
+                .unwrap()
+                .done
+                .as_ref()
+                .is_some_and(Result::is_err)
+        {
+            self.opened_error_log = true;
+            self.show_log = true;
+        }
         let (fraction, phase, detail, done, log, secs) = {
             let p = inst.progress.lock().unwrap();
             (
@@ -1036,7 +835,7 @@ impl App {
                     if self.updating {
                         "The update stopped. Nothing is lost: run the update again and it continues where it stopped."
                     } else {
-                        "The installation stopped. Nothing is lost: Try again continues where it stopped."
+                        "Try again to reuse completed work, or go back to change your setup."
                     },
                 );
                 card(ui, |ui| {
@@ -1154,15 +953,22 @@ impl App {
                 .clicked()
             {
                 let exe = Path::new(self.location.trim()).join(format!("{}.exe", self.title));
-                let _ = std::process::Command::new(exe)
+                match std::process::Command::new(exe)
+                    .arg("--play")
                     .current_dir(self.location.trim())
-                    .spawn();
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    .spawn()
+                {
+                    Ok(_) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+                    Err(e) => self.launch_error = Some(format!("Could not start the game: {e}")),
+                }
             }
             if ui.add(secondary("Open install folder")).clicked() {
                 setup::open_folder(Path::new(self.location.trim()));
             }
         });
+        if let Some(e) = &self.launch_error {
+            ui.label(RichText::new(e).color(BAD));
+        }
         ui.add_space(6.0);
         ui.label(RichText::new(format!("To update later, use \"Update {}\" in the Start menu (or run this setup again): it downloads only what changed.", self.title)).small().color(MUTED));
     }
@@ -1286,23 +1092,12 @@ impl eframe::App for App {
                     .stroke(Stroke::new(1.0_f32, Color32::from_rgb(0x1C, 0x22, 0x2B))),
             )
             .show(ctx, |ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    match self.page {
-                        Page::Welcome | Page::Requirements | Page::Game => {
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| match self.page {
+                        Page::Game => {
                             if ui
-                                .add_enabled(self.can_continue(), primary("Next"))
-                                .clicked()
-                            {
-                                self.page = match self.page {
-                                    Page::Welcome => Page::Requirements,
-                                    Page::Requirements => Page::Game,
-                                    _ => Page::Location,
-                                };
-                            }
-                        }
-                        Page::Location => {
-                            if ui
-                                .add_enabled(self.can_continue(), primary("Install"))
+                                .add_enabled(self.can_install(), primary("Install"))
                                 .clicked()
                             {
                                 self.start_install();
@@ -1325,12 +1120,12 @@ impl eframe::App for App {
                                     if ui.add(secondary("Back")).clicked() {
                                         if self.updating {
                                             self.updating = false;
-                                            self.page = Page::Welcome;
+                                            self.page = Page::Game;
                                             if let Some(d) = self.existing.clone() {
                                                 self.find_existing(d);
                                             }
                                         } else {
-                                            self.page = Page::Location;
+                                            self.page = Page::Game;
                                         }
                                     }
                                 }
@@ -1357,17 +1152,8 @@ impl eframe::App for App {
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             }
                         }
-                    }
-                    if matches!(self.page, Page::Requirements | Page::Game | Page::Location)
-                        && ui.add(secondary("Back")).clicked()
-                    {
-                        self.page = match self.page {
-                            Page::Requirements => Page::Welcome,
-                            Page::Game => Page::Requirements,
-                            _ => Page::Game,
-                        };
-                    }
-                });
+                    },
+                );
             });
 
         // ---- page ----
@@ -1382,21 +1168,14 @@ impl eframe::App for App {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| match self.page {
-                        Page::Welcome => self.page_welcome(ui),
-                        Page::Requirements => self.page_requirements(ui),
-                        Page::Game => self.page_game(ui),
-                        Page::Location => self.page_location(ui),
+                        Page::Game => self.page_setup(ui),
                         Page::Installing => self.page_installing(ui),
                         Page::Done => self.page_done(ui),
                     });
             });
 
         // Keep spinners moving while something runs in the background.
-        let busy = {
-            let r = self.reqs.lock().unwrap();
-            matches!(r.python, Check::Checking | Check::Installing(_))
-                || matches!(r.tools, Check::Checking | Check::Installing(_))
-        } || matches!(self.game_state.lock().unwrap().1, GameState::Checking);
+        let busy = matches!(self.game_state.lock().unwrap().1, GameState::Checking);
         if busy {
             ctx.request_repaint_after(std::time::Duration::from_millis(60));
         }

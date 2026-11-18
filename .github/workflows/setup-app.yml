@@ -59,6 +59,19 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
+      - name: Package standalone Setup
+        working-directory: .
+        shell: pwsh
+        run: |
+          installer/target/release/infamous-installer.exe package --root . --out "dist/inFamous Setup.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inFamous-Setup
+          path: dist/inFamous Setup.exe
+          if-no-files-found: error
+
       - uses: actions/upload-artifact@v4
         with:
           name: infamous-installer

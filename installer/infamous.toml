@@ -346,6 +346,9 @@ keep = [
   # only the build files the tree needs ("**/CMakeLists.txt" also pulled in excluded folders that have one)
   "infamous-recomp/CMakeLists.txt",
   "ps3recomp/CMakeLists.txt",
+  # Runtime headers whose names match the private savedata exclusion.
+  "ps3recomp/libs/system/savedata_slots.h",
+  "ps3recomp/libs/system/savedata_slot_dialog.h",
   "infamous-recomp/build.cmd",
   "infamous-recomp/spu/jobmods_extra_map.json",
   "infamous-recomp/spu/jobmod_50f371dc382d_e3D90/lodx_v231.h",
@@ -365,7 +368,7 @@ forbid = [
   "INFAMOUS_*.md", "PS3_PORTING_PLAYBOOK.md", "_audit_*/**",
   "**/REVIEW_*", "**/review_*", "**/*PROVENANCE*", "**/*provenance*", "**/_xfer*/**",
   "_to_delete/**", "**/tools/bench/**", "ps3recomp/scratch/**",
-  "**/gamedata*/**", "**/savedata*/**", "**/dev_hdd0/**",
+  "**/gamedata*/**", "**/savedata*/**/*", "**/dev_hdd0/**",
 ]
 
 # `infamous-installer update` and the setup's "Update now": where new versions come from. The repository

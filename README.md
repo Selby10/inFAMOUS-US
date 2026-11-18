@@ -45,7 +45,10 @@ To play:
 
 ## Easy install
 
-Download or run the installer targeting your `BCUS98119` folder (the one containing `PS3_GAME`), pick an install location, and press **Install**.
+Download the `inFamous-Setup` artifact from a successful **Setup app** workflow run and open
+`inFamous Setup.exe`. Select your own US or European ISO or an extracted folder containing
+`PS3_GAME`, then click **Install**. Setup installs missing build tools and builds the game on
+your PC. When the build finishes, click **Play**. [Setup details](installer/README.md#the-setup-program-what-players-download)
 
 ## Updating
 
