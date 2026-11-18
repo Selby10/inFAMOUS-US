@@ -66,6 +66,12 @@ jobs:
           installer/target/release/infamous-installer.exe package --root . --out "dist/inFamous Setup.exe"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Test packaged Python without system Python on PATH
+        shell: pwsh
+        run: |
+          $env:INFAMOUS_TEST_SETUP = (Resolve-Path '../dist/inFamous Setup.exe').Path
+          cargo test --release --locked --test packaged_python -- --ignored
+
       - uses: actions/upload-artifact@v4
         with:
           name: inFamous-Setup

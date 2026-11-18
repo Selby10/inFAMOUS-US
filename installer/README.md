@@ -23,7 +23,7 @@ cargo build --release
 You need:
 
 * **Your inFamous disc dump**: the folder that contains `PS3_GAME` (US release `BCUS98119`).
-* **Python 3.10+** from python.org, with "Add python.exe to PATH" ticked.
+* The Windows Setup download includes Python and the packages used to build the game.
 * **Visual Studio 2022 Build Tools** with the *Desktop development with C++* workload and the
   *C++ Clang Compiler for Windows* component.
 * **RPCS3**, if your `PS3_GAME\USRDIR` has only `EBOOT.BIN` and no decrypted `EBOOT.elf`.
@@ -43,7 +43,7 @@ The installer runs these steps:
    yourself in RPCS3 with *Utilities → Decrypt PS3 Binaries*.
 3. It checks the SHA-256 of `EBOOT.elf` against the version the port was made from.
 4. It links your dump into the checkout (a directory junction, so nothing is copied).
-5. It creates a private Python environment in `.installer\venv` and installs the toolkit's packages.
+5. It verifies and unpacks the bundled Python runtime under `.installer` and reuses it for later builds and updates. A developer can select a different Python with `--python EXE`, which uses the existing `.installer\venv` workflow.
 6. It runs the generation pipeline: PPU lift, SPU images, job manager, the 21 WWS job modules, the
    plugin blobs, the SPU post-passes and the UI assets.
 7. It checks every generated file against the hash recorded by the maintainer, then applies
@@ -81,7 +81,7 @@ Download the `inFamous-Setup` artifact from a successful **Setup app** workflow 
 or extracted game folder, then click **Install**. Setup fills in an install location and lets you
 change it or turn off shortcuts on the same screen.
 
-Setup checks the game and free space, installs missing Python and C++ build tools, and builds the
+Setup checks the game and free space, installs missing C++ build tools, and builds the
 game on your PC. Windows may ask for approval. If your ISO is encrypted, click **Find disc key online**. Setup downloads disc metadata for the supported releases and checks the key against your ISO locally. If lookup fails, retry or use **Choose disc key** to select a matching `.dkey`. Setup also recognizes a same-name key beside the ISO. If the game executable requires RPCS3 and
 Setup cannot find it, select your local `rpcs3.exe`. When the build finishes, click **Play**.
 Run Setup again with the same game and location to reuse a complete copy of the disc and the
@@ -100,11 +100,11 @@ rpcs3.exe in the usual places or asks for it.
 
 ## US Gigawatt Blades DLC
 
-After building the base game, import your US DLC package and matching RAP with
-the installer's Python environment (or another Python with `pycryptodome`):
+After building the base game, run this PowerShell command from the installed game folder to import your US DLC package and matching RAP:
 
-```bat
-.installer\venv\Scripts\python installer\tools\import_gigawatt.py --pkg "D:\DLC\Gigawatt.pkg" --rap "D:\DLC\UP9000-BCUS98119_00-SMLAUNCHPROMO000.rap" --hdd-root "D:\Games\inFAMOUS-US\HDD"
+```powershell
+$runtimeId = (Get-Content installer/runtime/python-win64.sha256 -Raw).Trim().Substring(0, 16)
+& ".installer/python-$runtimeId/python.exe" installer/tools/import_gigawatt.py --pkg "D:\DLC\Gigawatt.pkg" --rap "D:\DLC\UP9000-BCUS98119_00-SMLAUNCHPROMO000.rap" --hdd-root "D:\Games\inFAMOUS-US\HDD"
 ```
 
 The helper verifies the content ID and EDAT block authentication before installing
@@ -127,6 +127,8 @@ the graphical `inFamous.exe`, start it from this environment too. Import success
 verifies the file/license pair; verify the power in gameplay and after a restart.
 
 ## For the maintainer
+
+Windows Setup and the updater distribute `installer/runtime/python-win64.zip` and its SHA-256 file. To refresh them, update the CPython and wheel pins in `installer/tools/bundle_python.py`, then run `python installer/tools/bundle_python.py`. The script checks each download and retains the upstream licenses. Package and test the two files together. Players can use the runtime offline.
 
 The patch set has to be created once on the development tree, and again whenever the
 maintained generated files change:

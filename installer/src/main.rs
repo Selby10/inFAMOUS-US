@@ -9,7 +9,8 @@
 //!   infamous-installer export --out <dir>    (maintainer) copy the publishable source tree
 
 use infamous_installer::{
-    bail, game, hash, iso, lock, manifest, payload, pipeline, toolchain, trophy, update, util,
+    bail, game, hash, iso, lock, manifest, payload, pipeline, python_bundle, toolchain, trophy,
+    update, util,
 };
 use manifest::Manifest;
 use pipeline::Vars;
@@ -34,7 +35,7 @@ USAGE
 OPTIONS
   --game DIR        your game dump: the folder that contains PS3_GAME
   --rpcs3 EXE       rpcs3.exe, used to decrypt EBOOT.BIN if there is no EBOOT.elf yet
-  --python EXE      Python 3.10+ to use (default: py launcher / python on PATH)
+  --python EXE      use a separate Python 3.10+ and venv instead of the Windows bundle
   --root DIR        the port checkout (default: found from the installer's location)
   --jobs N          worker processes for the lifters (default: CPU count)
   --build-jobs N    parallel compiler jobs (default: 4; each needs several GB of RAM)
@@ -310,8 +311,23 @@ impl Session {
         }
     }
 
+    fn bundled_python(&self) -> Result<Option<PathBuf>> {
+        if cfg!(windows)
+            && self.o.python.is_none()
+            && (self.root.join(python_bundle::CHECKSUM).exists()
+                || self.root.join(python_bundle::ARCHIVE).exists())
+        {
+            return python_bundle::prepare(&self.root, self.m.py_min).map(Some);
+        }
+        Ok(None)
+    }
+
     fn python(&self) -> Result<PathBuf> {
         util::heading("Python");
+        if let Some(python) = self.bundled_python()? {
+            util::info(&format!("Using bundled Python ({})", python.display()));
+            return Ok(python);
+        }
         let (base, v) = toolchain::find_python(self.o.python.as_deref(), self.m.py_min)?;
         util::info(&format!(
             "Using Python {}.{} ({})",
@@ -874,6 +890,9 @@ fn cmd_extract_iso(o: &Opts) -> Result<()> {
 
 fn cmd_package(s: &Session) -> Result<()> {
     let out = s.o.out.clone().ctx(|| "package needs --out <setup.exe>")?;
+    if cfg!(windows) {
+        python_bundle::verify_for_package(&s.root)?;
+    }
     if lock::Lock::load(&s.installer_dir.join("generated.lock"))?.is_none() {
         bail!("installer/generated.lock is missing; run make-patches first");
     }
@@ -927,7 +946,9 @@ fn cmd_package(s: &Session) -> Result<()> {
 fn cmd_doctor(s: &Session) -> Result<()> {
     let mut ok = true;
     util::heading("Python");
-    match toolchain::find_python(s.o.python.as_deref(), s.m.py_min) {
+    match s.bundled_python().and_then(|bundle| {
+        toolchain::find_python(bundle.as_deref().or(s.o.python.as_deref()), s.m.py_min)
+    }) {
         Ok((p, v)) => util::info(&format!(
             "OK  Python {}.{} ({})",
             v.0,

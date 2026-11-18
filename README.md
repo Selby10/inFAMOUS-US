@@ -29,7 +29,7 @@ This dedicated US release tree integrates key structural rebases and optimizatio
 - Decrypted `EBOOT.elf` (SHA-256: `4f2db3fb7c76fbb4f80cbc8445cf0ea1570a664996a7787e690efcc1a39befb4`).
 - Windows 10 or 11 (64-bit) and a GPU with Direct3D 12 support.
 - A modern multi-core CPU. Multi-CCD AMD Ryzen and Intel hybrid CPUs are natively supported.
-- [Python 3.10+](https://www.python.org/downloads/) with "Add python.exe to PATH" ticked.
+- Windows Setup includes its own Python interpreter and build packages.
 - [Visual Studio 2022 Build Tools](https://visualstudio.microsoft.com/downloads/)
   with the **Desktop development with C++** workload and the **C++ Clang
   Compiler for Windows** component.

@@ -9,6 +9,7 @@ pub mod lock;
 pub mod manifest;
 pub mod payload;
 pub mod pipeline;
+pub mod python_bundle;
 pub mod save_manager;
 pub mod setup;
 pub mod toml;

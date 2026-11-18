@@ -827,7 +827,7 @@ impl App {
                 ui.checkbox(&mut self.start_menu, "Start menu shortcut");
             });
         });
-        ui.label(RichText::new("Setup installs missing Python and C++ tools and builds the game locally. Windows may ask for approval.").small().color(MUTED));
+        ui.label(RichText::new("Setup includes Python and its packages. Windows may ask for approval to install missing C++ build tools.").small().color(MUTED));
     }
 
     fn page_installing(&mut self, ui: &mut egui::Ui) {

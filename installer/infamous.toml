@@ -6,7 +6,7 @@
 # Placeholders available in steps and build commands:
 #   {root} {port} {toolkit}   the checkout, infamous-recomp/, ps3recomp/
 #   {game} {usrdir} {elf}     the player's dump, its PS3_GAME/USRDIR, the decrypted EBOOT.elf
-#   {python}                  the installer's private venv Python (requirements installed)
+#   {python}                  bundled Windows Python, or the selected development venv
 #   {work}                    scratch space: <root>/.installer/work
 #   {jobs}                    worker processes for the lifters
 #   {file}                    the current match of a step's `for_each`

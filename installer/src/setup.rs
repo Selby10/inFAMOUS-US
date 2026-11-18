@@ -1016,11 +1016,15 @@ fn install(
     if stopped() {
         return Err("cancelled".into());
     }
-    if let Check::Missing(reason) = check_python() {
-        set(0.0, "Installing Python", "Windows may ask for approval.");
-        log(reason);
-        install_python(&log)
-            .map_err(|e| format!("Python setup failed: {e}. Install Python 3.12 and try again."))?;
+    if matches!(&o.source, Source::Checkout { root, .. } if !root.join(crate::python_bundle::ARCHIVE).exists())
+    {
+        if let Check::Missing(reason) = check_python() {
+            set(0.0, "Installing Python", "Windows may ask for approval.");
+            log(reason);
+            install_python(&log).map_err(|e| {
+                format!("Python setup failed: {e}. Install Python 3.12 and try again.")
+            })?;
+        }
     }
     if stopped() {
         return Err("cancelled".into());
@@ -1315,10 +1319,7 @@ fn phase_for(h: &str) -> Option<(f32, String)> {
         ));
     }
     let x = match h {
-        "Python" => (
-            0.25,
-            "Setting up Python (the first time downloads a few packages)",
-        ),
+        "Python" => (0.25, "Preparing the private Python environment"),
         "Game files" => (0.25, "Checking your game"),
         "Checking the generated sources" => (0.26, "Checking for an earlier installation"),
         "Executable" => (0.26, "Unlocking the game's program file"),
