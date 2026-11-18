@@ -1,6 +1,7 @@
 //! Shared by the command-line installer, the setup program (GUI) and the game launcher.
 
 pub mod diff;
+mod disc_records;
 pub mod game;
 pub mod hash;
 pub mod iso;

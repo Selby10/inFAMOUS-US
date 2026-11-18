@@ -32,6 +32,8 @@ gui = ["dep:eframe", "dep:image", "dep:rfd"]
 
 # Dependencies are for Setup and the launcher UI. Game file tools use the standard library.
 [dependencies]
+aes = "0.8"
+flate2 = "1"
 eframe = { version = "0.29", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 rfd = { version = "0.15", optional = true }

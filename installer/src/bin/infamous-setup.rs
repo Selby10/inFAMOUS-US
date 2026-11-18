@@ -221,7 +221,9 @@ const PAGES: [(Page, &str); 3] = [
 enum GameState {
     None,
     Checking,
-    Ok(GameInfo),
+    LookingUp,
+    LookupFailed(String),
+    Ok(GameInfo, GameSource),
     Problem(GameProblem),
 }
 
@@ -476,19 +478,38 @@ impl App {
     }
 
     fn set_game(&mut self, src: GameSource) {
+        self.check_source(src, false);
+    }
+
+    fn check_source(&mut self, src: GameSource, lookup: bool) {
         self.game = Some(src.clone());
         self.game_gen += 1;
         let gen = self.game_gen;
-        *self.game_state.lock().unwrap() = (gen, GameState::Checking);
+        *self.game_state.lock().unwrap() = (
+            gen,
+            if lookup {
+                GameState::LookingUp
+            } else {
+                GameState::Checking
+            },
+        );
         let (st, rp, ids) = (
             self.game_state.clone(),
             self.repaint.clone(),
             self.title_ids.clone(),
         );
         std::thread::spawn(move || {
-            let r = match setup::check_game(&src, &ids) {
-                Ok(i) => GameState::Ok(i),
-                Err(p) => GameState::Problem(p),
+            let r = match &src {
+                GameSource::Iso { path, .. } if lookup => {
+                    match setup::lookup_disc_key(path, &ids) {
+                        Ok((info, source)) => GameState::Ok(info, source),
+                        Err(msg) => GameState::LookupFailed(msg),
+                    }
+                }
+                _ => match setup::check_game(&src, &ids) {
+                    Ok(i) => GameState::Ok(i, src),
+                    Err(p) => GameState::Problem(p),
+                },
             };
             let mut g = st.lock().unwrap();
             if g.0 == gen {
@@ -501,7 +522,7 @@ impl App {
 
     fn game_info(&self) -> Option<GameInfo> {
         match &self.game_state.lock().unwrap().1 {
-            GameState::Ok(i) => Some(i.clone()),
+            GameState::Ok(i, _) => Some(i.clone()),
             _ => None,
         }
     }
@@ -518,7 +539,10 @@ impl App {
         if !self.can_install() {
             return;
         }
-        let (Some(game), Some(source)) = (self.game.clone(), self.source.clone()) else {
+        let (GameState::Ok(_, game), Some(source)) = (
+            self.game_state.lock().unwrap().1.clone(),
+            self.source.clone(),
+        ) else {
             return;
         };
         let needs = self.game_info().map(|i| i.needs_rpcs3).unwrap_or(true);
@@ -602,7 +626,7 @@ impl App {
         ui.add_space(4.0);
         let state = self.game_state.lock().unwrap().1.clone();
         let Some(src) = self.game.clone() else {
-            ui.label(RichText::new("Disc images from Redump that come with a .dkey file work too: keep the .dkey next to the .iso.").small().color(MUTED));
+            ui.label(RichText::new("For an encrypted ISO, Setup can find the disc key online or use a matching .dkey file.").small().color(MUTED));
             return;
         };
         let shown = match &src {
@@ -614,22 +638,28 @@ impl App {
                 icon(
                     ui,
                     match &state {
-                        GameState::Ok(_) => Icon::Ok,
-                        GameState::Checking | GameState::None => Icon::Busy,
+                        GameState::Ok(..) => Icon::Ok,
+                        GameState::LookingUp | GameState::Checking | GameState::None => Icon::Busy,
                         GameState::Problem(GameProblem::NeedsKey) => Icon::Warn,
-                        GameState::Problem(_) => Icon::Bad,
+                        GameState::LookupFailed(_) | GameState::Problem(_) => Icon::Bad,
                     },
                 );
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 3.0;
                     match &state {
-                        GameState::Ok(i) => {
+                        GameState::Ok(i, _) => {
                             ui.label(
                                 RichText::new(format!("{}  ·  {}", i.title, i.title_id)).strong(),
                             );
                         }
                         GameState::Checking | GameState::None => {
                             ui.label(RichText::new("Checking...").strong());
+                        }
+                        GameState::LookingUp => {
+                            ui.label("Looking for a matching disc key?");
+                        }
+                        GameState::LookupFailed(msg) => {
+                            ui.colored_label(WARN, msg);
                         }
                         GameState::Problem(p) => {
                             ui.label(RichText::new(p.to_string()).strong().color(
@@ -642,7 +672,7 @@ impl App {
                         }
                     }
                     let mut sub = util::path_str(&shown);
-                    if let GameState::Ok(i) = &state {
+                    if let GameState::Ok(i, _) = &state {
                         if i.copy_bytes > 0 {
                             sub.push_str(&format!(
                                 "\n{} of game files",
@@ -659,11 +689,17 @@ impl App {
             if let (
                 GameState::Problem(
                     GameProblem::NeedsKey | GameProblem::BadKey | GameProblem::Other(_),
-                ),
+                )
+                | GameState::LookupFailed(_),
                 GameSource::Iso { path, .. },
             ) = (&state, &src)
             {
                 ui.add_space(4.0);
+                if !matches!(state, GameState::Problem(GameProblem::Other(_)))
+                    && ui.add(primary("Find disc key online")).clicked()
+                {
+                    self.check_source(src.clone(), true);
+                }
                 if ui.add(primary("Choose disc key (.dkey)...")).clicked() {
                     let mut d = rfd::FileDialog::new()
                         .set_title("Choose the disc key for this image")
@@ -674,14 +710,14 @@ impl App {
                     if let Some(k) = d.pick_file() {
                         self.set_game(GameSource::Iso {
                             path: path.clone(),
-                            key: Some(k),
+                            key: Some(setup::DiscKey::File(k)),
                         });
                     }
                 }
             }
         });
 
-        if let GameState::Ok(i) = &state {
+        if let GameState::Ok(i, _) = &state {
             if i.needs_rpcs3 {
                 if !self.rpcs3_searched {
                     self.rpcs3_searched = true;
@@ -1175,7 +1211,10 @@ impl eframe::App for App {
             });
 
         // Keep spinners moving while something runs in the background.
-        let busy = matches!(self.game_state.lock().unwrap().1, GameState::Checking);
+        let busy = matches!(
+            self.game_state.lock().unwrap().1,
+            GameState::Checking | GameState::LookingUp
+        );
         if busy {
             ctx.request_repaint_after(std::time::Duration::from_millis(60));
         }

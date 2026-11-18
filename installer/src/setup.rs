@@ -305,8 +305,14 @@ pub fn install_build_tools(log: &(dyn Fn(String) + Sync)) -> Result<(), String> 
 // ---------------------------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
+pub enum DiscKey {
+    File(PathBuf),
+    Online([u8; 16]),
+}
+
+#[derive(Clone, Debug)]
 pub enum GameSource {
-    Iso { path: PathBuf, key: Option<PathBuf> },
+    Iso { path: PathBuf, key: Option<DiscKey> },
     Folder(PathBuf),
 }
 
@@ -332,9 +338,7 @@ pub enum GameProblem {
 impl std::fmt::Display for GameProblem {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            GameProblem::NeedsKey => {
-                f.write_str("This disc image is encrypted. Choose its disc key (.dkey) file.")
-            }
+            GameProblem::NeedsKey => f.write_str("This disc image needs a disc key."),
             GameProblem::BadKey => f.write_str("That disc key doesn't belong to this disc image."),
             GameProblem::WrongGame { title, title_id } => write!(
                 f,
@@ -345,11 +349,13 @@ impl std::fmt::Display for GameProblem {
     }
 }
 
+pub use crate::disc_records::lookup_disc_key;
+
 pub fn check_game(src: &GameSource, title_ids: &[String]) -> Result<GameInfo, GameProblem> {
     let other = |e: util::Error| GameProblem::Other(e.to_string());
     let (sfo, copy_bytes, encrypted, needs_rpcs3) = match src {
         GameSource::Iso { path, key } => {
-            let mut img = open_game_image(path, key.as_deref())?;
+            let mut img = open_game_image(path, key.as_ref())?;
             let e = img.find("PS3_GAME/PARAM.SFO").ok_or_else(|| {
                 GameProblem::Other("This is not a PS3 game disc (no PS3_GAME/PARAM.SFO).".into())
             })?;
@@ -396,15 +402,18 @@ pub fn check_game(src: &GameSource, title_ids: &[String]) -> Result<GameInfo, Ga
     })
 }
 
-fn open_game_image(path: &Path, key: Option<&Path>) -> Result<iso::Iso, GameProblem> {
-    let key = key
-        .map(iso::read_key_file)
-        .transpose()
-        .map_err(|_| GameProblem::BadKey)?;
+fn open_game_image(path: &Path, key: Option<&DiscKey>) -> Result<iso::Iso, GameProblem> {
+    let key = match key {
+        Some(DiscKey::Online(key)) => Some(*key),
+        Some(DiscKey::File(file)) => {
+            Some(iso::read_key_file(file).map_err(|_| GameProblem::BadKey)?)
+        }
+        None => None,
+    };
     let mut img = iso::open_ready(path, key).map_err(|e| {
         if e.0.contains("needs its disc key") {
             GameProblem::NeedsKey
-        } else if e.0.contains("does not fit") {
+        } else if e.0.contains("does not fit") || e.0.contains("is not a disc key") {
             GameProblem::BadKey
         } else {
             GameProblem::Other(e.to_string())
@@ -978,7 +987,7 @@ fn install(
                 ));
             }
             let stamp = image_stamp(path).map_err(estr_io)?;
-            let image = open_game_image(path, key.as_deref()).map_err(|e| e.to_string())?;
+            let image = open_game_image(path, key.as_ref()).map_err(|e| e.to_string())?;
             let cached = cached_image(&dest, &stamp, &image);
             Some((path, stamp, image, cached))
         }

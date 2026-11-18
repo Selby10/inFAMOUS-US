@@ -82,8 +82,7 @@ or extracted game folder, then click **Install**. Setup fills in an install loca
 change it or turn off shortcuts on the same screen.
 
 Setup checks the game and free space, installs missing Python and C++ build tools, and builds the
-game on your PC. Windows may ask for approval. If your ISO is encrypted, keep its matching
-`.dkey` next to the ISO or select the key in Setup. If the game executable requires RPCS3 and
+game on your PC. Windows may ask for approval. If your ISO is encrypted, click **Find disc key online**. Setup downloads disc metadata for the supported releases and checks the key against your ISO locally. If lookup fails, retry or use **Choose disc key** to select a matching `.dkey`. Setup also recognizes a same-name key beside the ISO. If the game executable requires RPCS3 and
 Setup cannot find it, select your local `rpcs3.exe`. When the build finishes, click **Play**.
 Run Setup again with the same game and location to reuse a complete copy of the disc and the
 incremental build. Setup shows details if a step fails so you can correct the issue and retry.

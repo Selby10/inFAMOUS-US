@@ -83,7 +83,7 @@ fn normalize_repo(r: &str) -> Result<String> {
 // HTTP (curl)
 // ---------------------------------------------------------------------------------------------
 
-fn curl_cmd(remote: &Remote, url: &str, accept: Option<&str>, trusted_redirect: bool) -> Command {
+pub(crate) fn curl_program() -> Command {
     let prog = if cfg!(windows) {
         // The real curl.exe, never a PowerShell alias; it ships in System32 since Windows 10 1803.
         let sys = std::env::var("SystemRoot")
@@ -97,6 +97,17 @@ fn curl_cmd(remote: &Remote, url: &str, accept: Option<&str>, trusted_redirect: 
         PathBuf::from("curl")
     };
     let mut c = Command::new(prog);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000);
+    }
+    c.stdin(Stdio::null());
+    c
+}
+
+fn curl_cmd(remote: &Remote, url: &str, accept: Option<&str>, trusted_redirect: bool) -> Command {
+    let mut c = curl_program();
     c.args([
         "-fsSL",
         "--retry",
@@ -119,12 +130,6 @@ fn curl_cmd(remote: &Remote, url: &str, accept: Option<&str>, trusted_redirect: 
         }
     }
     c.arg(url);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        c.creation_flags(0x0800_0000); // no console window when started from the setup program
-    }
-    c.stdin(Stdio::null());
     c
 }
 
