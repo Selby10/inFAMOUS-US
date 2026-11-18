@@ -174,6 +174,10 @@ real edits instead of every line. Run `make-patches` on Windows, because that is
 
 ### Launcher save management
 
+The standard build opens a dashboard with **Play**, **Display & Controls**, **Saves**,
+and **Support**. The Support tab opens game logs and checks for updates using the
+installed manifest. Launching with `--play` still goes straight into the game.
+
 The launcher resolves `SAVEDATA_ROOT` with the same launch environment as the game;
 without an override it uses `<game working folder>/gamedata/dev_hdd0/home/00000001/savedata`.
 It does not infer saves from `PS3_HDD0_ROOT`, because the runtime's save subsystem

@@ -1,4 +1,4 @@
-//! `inFamous.exe`: the launcher. A plain native Windows options dialog with the game's settings (the
+//! `inFamous.exe`: the launcher. The dashboard uses the game's settings (the
 //! same ones as the in-game Settings menu, pause menu > Settings). Play writes them to `settings.ini` and starts the game
 //! the way `installer/launch.txt` says, without a console window.
 //!
@@ -237,7 +237,7 @@ impl Launch {
 struct Row {
     key: &'static str,
     label: &'static str,
-    #[allow(dead_code)] // kept with each row for documentation; the dialog has no tooltips
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     hint: &'static str,
     vals: &'static [&'static str],
     names: &'static [&'static str],
@@ -748,7 +748,11 @@ impl State {
 
 // ---- the window: a plain native Windows dialog (real controls, ClearType, per-monitor DPI) -------
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "gui"))]
+#[path = "infamous-launch/dashboard.rs"]
+mod dashboard;
+
+#[cfg(all(windows, not(feature = "gui")))]
 mod win {
     use super::*;
     use std::cell::RefCell;
@@ -2034,7 +2038,9 @@ fn main() {
         return;
     }
     let settings_only = launch.settings_only;
-    #[cfg(windows)]
+    #[cfg(all(windows, feature = "gui"))]
+    let played = dashboard::run(State::new(launch));
+    #[cfg(all(windows, not(feature = "gui")))]
     let played = win::run(State::new(launch));
     #[cfg(not(windows))]
     let played = {

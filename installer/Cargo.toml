@@ -15,7 +15,7 @@ path = "src/lib.rs"
 name = "infamous-installer"
 path = "src/main.rs"
 
-# inFamous.exe: the launcher (native settings dialog, then starts the game without a console).
+# inFamous.exe: the launcher (dashboard, then starts the game without a console).
 [[bin]]
 name = "infamous-launch"
 path = "src/bin/infamous-launch.rs"
@@ -28,12 +28,12 @@ required-features = ["gui"]
 
 [features]
 default = ["gui"]
-gui = ["dep:eframe", "dep:rfd"]
+gui = ["dep:eframe", "dep:image", "dep:rfd"]
 
-# Only the setup window (eframe) and the launcher dialog (windows-sys, Windows only) have dependencies. Everything that touches the game files (ISO reading,
-# decryption, patching, hashing) is in this crate with no third-party code.
+# Dependencies are for Setup and the launcher UI. Game file tools use the standard library.
 [dependencies]
 eframe = { version = "0.29", optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 rfd = { version = "0.15", optional = true }
 
 [target.'cfg(windows)'.dependencies]

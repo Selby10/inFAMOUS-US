@@ -93,7 +93,21 @@ uses the monitor; the Window Size choice is used when returning to windowed mode
 
 ### Settings and save manager
 
-The launcher now has **Settings** and **Saves** tabs. Saves shows the active save
+The launcher opens on **Play** with the detected region, installation status, and quick display
+settings. **Display & Controls** has the full settings list. **Support** opens the current
+and previous game logs, copies build details, and checks GitHub for updates.
+
+### Achievements
+
+The game shows a brief notification when it awards a PS3 trophy. Open **Achievements**
+in the launcher to see earned and locked trophies and your completion count. Hidden
+trophy names and descriptions appear after you earn them. The installer reads the
+trophy list from your disc dump, and local progress lives in `infamous-recomp/gamedata/trophies/`.
+Run Setup or the updater to rebuild an existing installation with trophy notifications.
+
+### Saves and backups
+
+**Saves** shows the active save
 folder, US/European save slots and last-modified times in UTC. Use **Open Save
 Folder**, **Back Up Saves**, **Back Up Settings**, or **Back Up Everything**.
 Settings backups include `settings.ini` and `controls.ini` when present.

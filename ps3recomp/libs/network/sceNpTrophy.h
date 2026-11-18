@@ -108,6 +108,14 @@ typedef struct SceNpTrophyFlagArray {
  * Functions
  * -----------------------------------------------------------------------*/
 
+/* Host-only notification queue, consumed by the native graphics overlay. */
+typedef struct {
+    int grade;
+    char name[SCE_NP_TROPHY_NAME_MAX_SIZE];
+} SceNpTrophyNotice;
+
+int sceNpTrophyPopNotice(SceNpTrophyNotice* out);
+
 s32 sceNpTrophyInit(void* poolPtr, u32 poolSize, u32 containerId, u64 options);
 s32 sceNpTrophyTerm(void);
 

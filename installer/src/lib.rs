@@ -8,10 +8,10 @@ pub mod lock;
 pub mod manifest;
 pub mod payload;
 pub mod pipeline;
+pub mod save_manager;
 pub mod setup;
 pub mod toml;
 pub mod toolchain;
+pub mod trophy;
 pub mod update;
 pub mod util;
-
-pub mod save_manager;

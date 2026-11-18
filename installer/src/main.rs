@@ -9,7 +9,7 @@
 //!   infamous-installer export --out <dir>    (maintainer) copy the publishable source tree
 
 use infamous_installer::{
-    bail, game, hash, iso, lock, manifest, payload, pipeline, toolchain, update, util,
+    bail, game, hash, iso, lock, manifest, payload, pipeline, toolchain, trophy, update, util,
 };
 use manifest::Manifest;
 use pipeline::Vars;
@@ -465,6 +465,12 @@ fn cmd_install(s: &Session) -> Result<()> {
             let kept = restore_mtimes(&before);
             util::info(&format!("{kept} of {} generated file(s) unchanged by this update (they will not be recompiled)", before.len()));
         }
+    }
+
+    if let Err(e) = trophy::read_catalog(&g.root)
+        .and_then(|catalog| catalog.write_runtime_catalog(&s.root.join(&s.m.port)))
+    {
+        util::warn(&format!("Named trophy notifications are unavailable: {e}"));
     }
 
     if s.o.no_build {

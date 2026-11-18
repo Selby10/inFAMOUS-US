@@ -36,6 +36,7 @@ const uiov_trainer_api* volatile g_uiov_trainer = 0;
 #include <d3dcompiler.h>
 #include "../input/cellPad.h"
 #include "../input/pad_host.h"
+#include "../network/sceNpTrophy.h"
 #include <math.h>
 #include <limits.h>
 
@@ -1018,19 +1019,58 @@ static void fps_build(void)
     text_draw(t, (int)strlen(t), 28.0f, 16.0f + 20.0f - sz * 0.62f, sz, fg);
 }
 static void uiov_draw_list(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv, unsigned bbw, unsigned bbh);
-static void fps_only(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv, unsigned bbw, unsigned bbh, DXGI_FORMAT rtfmt)
+static SceNpTrophyNotice s_trophy_notice;
+static ULONGLONG s_trophy_notice_until;
+
+static void trophy_notice_tick(void)
 {
-    if (!g_uiov_show_fps || !font_load() || !gfx_init(dev, rtfmt)) return;
+    ULONGLONG now = GetTickCount64();
+    if (now >= s_trophy_notice_until) {
+        s_trophy_notice_until = sceNpTrophyPopNotice(&s_trophy_notice) ? now + 3800 : 0;
+    }
+}
+
+static void trophy_notice_build(void)
+{
+    if (!s_trophy_notice_until) return;
+    const char* label = "TROPHY UNLOCKED";
+    float accent[4] = {0.40f, 0.78f, 1.0f, 1.0f};
+    switch (s_trophy_notice.grade) {
+    case SCE_NP_TROPHY_GRADE_PLATINUM: label = "PLATINUM TROPHY UNLOCKED"; break;
+    case SCE_NP_TROPHY_GRADE_GOLD:
+        label = "GOLD TROPHY UNLOCKED"; rgba(accent, 1.0f, 0.78f, 0.30f, 1.0f); break;
+    case SCE_NP_TROPHY_GRADE_SILVER:
+        label = "SILVER TROPHY UNLOCKED"; rgba(accent, 0.80f, 0.87f, 0.95f, 1.0f); break;
+    case SCE_NP_TROPHY_GRADE_BRONZE:
+        label = "BRONZE TROPHY UNLOCKED"; rgba(accent, 0.97f, 0.64f, 0.40f, 1.0f); break;
+    }
+    const float bg[4] = {0.035f, 0.055f, 0.085f, 0.96f};
+    const float fg[4] = {0.95f, 0.97f, 1.0f, 1.0f};
+    const float right = s_vw - 24.0f, left = fmaxf(12.0f, right - 356.0f);
+    const int len = (int)strlen(s_trophy_notice.name);
+    const float width = text_width(s_trophy_notice.name, len, 23.0f);
+    const float size = width > right - left - 36.0f ? 23.0f * (right - left - 36.0f) / width : 23.0f;
+    rect(left, 28, right, 104, bg, bg, 0);
+    rect(left, 28, left + 4, 104, accent, accent, 0);
+    text_draw(label, (int)strlen(label), left + 18, 42, 13, accent);
+    text_draw(s_trophy_notice.name, len, left + 18, 65, size, fg);
+}
+
+static void passive_overlay(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv, unsigned bbw, unsigned bbh, DXGI_FORMAT rtfmt)
+{
+    if ((!g_uiov_show_fps && !s_trophy_notice_until) || !font_load() || !gfx_init(dev, rtfmt)) return;
     s_k = bbh / UIOV_VW_H; s_vw = bbw / s_k;
     s_vbi = (s_vbi + 1) % UIOV_FRAMES;
     s_v = s_vbmap[s_vbi]; s_nv = 0;
     fps_build();
+    trophy_notice_build();
     if (s_nv) uiov_draw_list(cl, rtv, bbw, bbh);
 }
 void uiov_render(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
                  unsigned bbw, unsigned bbh, DXGI_FORMAT rtfmt, HWND hwnd)
 {
     fps_tick();   /* v212 */
+    trophy_notice_tick();
     /* v194: settings menu / pause hint (when no system dialog is up) */
     if (!D.active && font_load()) {
         s_k = bbh / UIOV_VW_H; s_vw = bbw / s_k;
@@ -1044,20 +1084,21 @@ void uiov_render(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, D3D12_CPU_DES
             else if (s_menu_open) build_menu();
             else { if (s_hint_on) build_hint(); if (s_wm_on) build_watermark(); else tr_hud_build(); }   /* v238 */
             fps_build();   /* v212 */
+            trophy_notice_build();
             if (s_nv) uiov_draw_list(cl, rtv, bbw, bbh);
             return;
         }
     }
     ULONGLONG now = GetTickCount64();
     s_last_draw_ms = now;
-    if (s_cs_ready != 2) { fps_only(dev, cl, rtv, bbw, bbh, rtfmt); return; }   /* no dialog was ever opened */
+    if (s_cs_ready != 2) { passive_overlay(dev, cl, rtv, bbw, bbh, rtfmt); return; }   /* no dialog was ever opened */
     lock();
     int active = D.active;
     float a_close = 0.0f;
     if (!active && D.t_close && now - D.t_close < 140) a_close = D.fade_close * (1.0f - (now - D.t_close) / 140.0f);
     /* v168: nothing on screen and no answering key to wait for -> no input polling (XInputGetState on empty
      * slots is slow and this runs every frame). */
-    if (!active && !D.held && a_close <= 0.0f) { unlock(); fps_only(dev, cl, rtv, bbw, bbh, rtfmt); return; }
+    if (!active && !D.held && a_close <= 0.0f) { unlock(); passive_overlay(dev, cl, rtv, bbw, bbh, rtfmt); return; }
     /* input */
     unsigned in = read_input(hwnd);
     /* v168 FIX: 'held' only covers the key that ANSWERED the dialog, until it is released (v164 re-armed it on
@@ -1097,7 +1138,7 @@ void uiov_render(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, D3D12_CPU_DES
     } else if (active) {
         D.prev = D.prev == 0xFFFFFFFFu ? in : D.prev;
     }
-    if (!active && a_close <= 0.0f) { unlock(); fps_only(dev, cl, rtv, bbw, bbh, rtfmt); return; }
+    if (!active && a_close <= 0.0f) { unlock(); passive_overlay(dev, cl, rtv, bbw, bbh, rtfmt); return; }
     char msg[2048]; int kind, sel; float alpha, grow = 1.0f;
     if (active) {
         memcpy(msg, D.msg, sizeof msg); kind = D.kind; sel = D.sel;
@@ -1115,6 +1156,7 @@ void uiov_render(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, D3D12_CPU_DES
     s_nb = active ? nb : 0;                      /* button rects for next frame's mouse test */
     if (s_nb) memcpy(s_br, br, sizeof(BtnRect) * s_nb);
     fps_build();   /* v212 */
+    trophy_notice_build();
     if (!s_nv) return;
     uiov_draw_list(cl, rtv, bbw, bbh);
 }

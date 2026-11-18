@@ -1618,6 +1618,7 @@ name = "infamous-installer"
 version = "0.2.0"
 dependencies = [
  "eframe",
+ "image",
  "rfd",
  "windows-sys 0.59.0",
 ]
