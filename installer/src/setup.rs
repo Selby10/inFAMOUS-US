@@ -1326,6 +1326,7 @@ fn phase_for(h: &str) -> Option<(f32, String)> {
         "Regenerating the game code from your files" => (0.27, "Rebuilding the game code"),
         "Applying the port's patches" => (0.53, "Applying the PC port's changes"),
         "Compiler" => (0.55, "Preparing the compiler"),
+        "Preparing DLSS and FSR" => (0.56, "Preparing DLSS and FSR"),
         "Configuring (CMake)" => (0.57, "Preparing the build"),
         "Done" => (0.99, "Finishing"),
         "Checking for updates" => (0.02, "Checking GitHub for a new version"),

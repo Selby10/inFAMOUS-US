@@ -308,6 +308,7 @@ exclude = [
   "infamous-recomp/spu/**",
   # backups, transfers, audits, third-party binaries
   "_xfer/", "_to_delete/", "_audit_*/", "github/",
+  "dlss-sdk/", "fsr-sdk/",
   "infamous-recomp/_bench/",                # bench runner jobs, logs, screenshots and SAVE GAMES
   "infamous-recomp/_xfer/", "infamous-recomp/_xfer_v144/",
   "tools/rpcs3/", "tools/rpcs3.7z",

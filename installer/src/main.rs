@@ -10,7 +10,7 @@
 
 use infamous_installer::{
     bail, game, hash, iso, lock, manifest, payload, pipeline, python_bundle, toolchain, trophy,
-    update, util,
+    update, upscalers, util,
 };
 use manifest::Manifest;
 use pipeline::Vars;
@@ -547,14 +547,28 @@ fn build(s: &Session, vars: &mut Vars) -> Result<PathBuf> {
             .envs(env.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         Ok(c)
     };
+    let exe = PathBuf::from(vars.expand(exe)?);
+    let mut configure = mk(configure)?;
+    let mut upscalers_ready = false;
+    if cfg!(windows) {
+        util::heading("Preparing DLSS and FSR");
+        let output = exe
+            .parent()
+            .ctx(|| "the game executable has no output folder")?;
+        let (args, ready) = upscalers::configure_args(&s.root, output)?;
+        configure.args(args);
+        upscalers_ready = ready;
+    }
     util::heading("Configuring (CMake)");
-    util::run(&mut mk(configure)?)?;
+    util::run(&mut configure)?;
     util::heading("Compiling -- the lifted code is huge; expect a long first build");
     let log = PathBuf::from(vars.expand(&s.m.build_log)?);
     toolchain::run_logged(&mut mk(compile)?, &log)?;
-    let exe = PathBuf::from(vars.expand(exe)?);
     if !exe.is_file() {
         bail!("the build finished but {} is missing", exe.display());
+    }
+    if cfg!(windows) {
+        upscalers::record_build(&s.root, upscalers_ready)?;
     }
     util::info(&format!("Built {}", exe.display()));
     Ok(exe)
@@ -613,6 +627,7 @@ fn cmd_update(s: &Session) -> Result<()> {
     let short = &plan.commit[..10];
     let pending_marker = s.root.join(".installer").join("update.pending");
     let pending = pending_marker.is_file();
+    let upscalers_pending = upscalers::needs_provisioning(&s.root);
     if plan.is_empty() {
         util::info(&format!("Already up to date (version {short})."));
     } else {
@@ -628,7 +643,7 @@ fn cmd_update(s: &Session) -> Result<()> {
         // One machine-readable line for the setup program.
         println!(
             "UPDATE-CHECK {} {} {} {}",
-            if plan.is_empty() && !pending {
+            if plan.is_empty() && !pending && !upscalers_pending {
                 "current"
             } else {
                 "available"
@@ -639,7 +654,7 @@ fn cmd_update(s: &Session) -> Result<()> {
         );
         return Ok(());
     }
-    if plan.is_empty() && !pending {
+    if plan.is_empty() && !pending && !upscalers_pending {
         util::heading("Done");
         util::info("Nothing to do.");
         return Ok(());
@@ -650,10 +665,12 @@ fn cmd_update(s: &Session) -> Result<()> {
         util::write_file(&pending_marker, plan.commit.as_bytes())?;
         update::apply(&s.root, &remote, &plan, &mut |l| util::info(&l))?;
         util::info(&format!("Files updated to version {short}."));
-    } else {
+    } else if pending {
         util::info(
             "The files are current, but the last update did not finish building; building now.",
         );
+    } else {
+        util::info("The files are current. Preparing DLSS and FSR support.");
     }
 
     // Rebuild with the (possibly new) manifest and patch set. Regenerate only if the patch set's
@@ -932,6 +949,10 @@ fn cmd_package(s: &Session) -> Result<()> {
         .collect();
     list.push((format!("installer/infamous-installer{ext}"), me.clone()));
     list.push((format!("{}{ext}", s.m.game_title), launcher));
+    if cfg!(windows) {
+        util::heading("Bundling the AMD FSR runtime and build files");
+        list.extend(upscalers::bundled_fsr(&s.root)?);
+    }
     let size = payload::write(&stub, &list, &out)?;
     util::info(&format!(
         "{} files -> {} ({})",

@@ -16,4 +16,5 @@ pub mod toml;
 pub mod toolchain;
 pub mod trophy;
 pub mod update;
+pub mod upscalers;
 pub mod util;
