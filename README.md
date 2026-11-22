@@ -52,7 +52,10 @@ your PC. When the build finishes, click **Play**. [Setup details](installer/READ
 
 ## Updating
 
-When updates are published to this repository, run `Update inFamous.cmd` in the root folder. The updater compares files, pulls updates, and recompiles only what changed.
+Run `Update inFamous (US).cmd` in the root folder. The updater pulls changed files from `main`,
+including the installer and launcher from the latest successful Setup app build published to
+`main`, and recompiles only what changed. Release downloads are available on
+[GitHub Releases](https://github.com/WoofahRayetCode/inFAMOUS-US/releases).
 
 ## Building manually
 

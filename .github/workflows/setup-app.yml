@@ -1,13 +1,9 @@
 name: Setup app
 
 on:
+  # Every push can supersede a build before it publishes to the default branch.
   push:
-    paths:
-      - "installer/**"
-      - "infamous-recomp/**"
-      - "ps3recomp/**"
-      - "sdl3/**"
-      - ".github/workflows/setup-app.yml"
+    branches: ['**']
   pull_request:
     paths:
       - ".github/workflows/setup-app.yml"
@@ -16,6 +12,9 @@ on:
       - "ps3recomp/**"
       - "sdl3/**"
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -86,3 +85,62 @@ jobs:
             installer/target/release/infamous-setup.exe
             installer/target/release/infamous-launch.exe
           if-no-files-found: error
+
+  publish-updater:
+    name: Publish updater binaries
+    needs: build
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          token: ${{ github.token }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: infamous-installer
+          path: ${{ runner.temp }}/updater-binaries
+
+      - name: Publish tested installer and launcher
+        shell: bash
+        env:
+          TARGET_REF: ${{ github.ref }}
+        run: |
+          artifact="$RUNNER_TEMP/updater-binaries"
+          test -s "$artifact/infamous-installer.exe"
+          test -s "$artifact/infamous-launch.exe"
+          cp "$artifact/infamous-installer.exe" "$artifact/infamous-launch.exe" installer/bin/
+          git add -- installer/bin/infamous-installer.exe installer/bin/infamous-launch.exe
+          if git diff --cached --quiet; then
+            echo 'Updater binaries are already current.'
+            exit 0
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Refresh updater binaries from Setup app build'
+
+          # Compare with the current tip, then use a normal push to guard against a race.
+          branch_tip() {
+            git ls-remote --exit-code origin "$TARGET_REF" | cut -f1
+          }
+          tip=$(branch_tip)
+          if [[ "$tip" != "$GITHUB_SHA" ]]; then
+            echo 'The default branch moved after this build. Skipping publication.'
+            exit 0
+          fi
+          if git push origin "HEAD:$TARGET_REF"; then
+            exit 0
+          fi
+
+          tip=$(branch_tip)
+          if [[ "$tip" != "$GITHUB_SHA" ]]; then
+            echo 'Another push moved the default branch. Skipping publication.'
+            exit 0
+          fi
+          exit 1
