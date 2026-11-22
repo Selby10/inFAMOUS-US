@@ -10,7 +10,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from analyze_frames import analyze, summarize
 from analyze_host_frames import (BACKGROUND_SCOPE, FOREGROUND_SCOPE, FLAG_CLOCK_ERROR, FLAG_FULL,
@@ -54,10 +54,12 @@ class ValidationTests(unittest.TestCase):
                     self.host_capture(Path(env[HOST_FRAME_ENV]).parent, [(100, 1), (116, 2)])
                     return SimpleNamespace(pid=42, returncode=0, poll=lambda: 0)
 
+                popen = Mock(side_effect=launch)
+                # Python 3.11 uses the real subprocess module to discover the Windows version.
+                validation_subprocess = SimpleNamespace(CREATE_NO_WINDOW=0, Popen=popen)
                 with (chdir(root.parent), patch.object(sys, 'argv', argv), redirect_stdout(io.StringIO()),
                       patch('run_validation.command_output', return_value='') as command_output,
-                      patch('run_validation.subprocess.CREATE_NO_WINDOW', 0, create=True),
-                      patch('run_validation.subprocess.Popen', side_effect=launch) as popen):
+                      patch('run_validation.subprocess', validation_subprocess)):
                     main()
                 popen.assert_called_once()
                 image_filters = {call.args[0][2].casefold() for call in command_output.call_args_list
