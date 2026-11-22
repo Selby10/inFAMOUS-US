@@ -46,6 +46,11 @@ void rsx_d3d12_backend_shutdown(void);
 /* Process Win32 messages. Returns 0 normally, -1 if window closed. */
 int rsx_d3d12_backend_pump_messages(void);
 
+#ifdef _WIN32
+/* Persist pending D3D12 pipeline-library and DXBC pack changes. */
+void rsx_d3d12_psolib_flush(void);
+#endif
+
 /* Force a present (useful for debugging). */
 void rsx_d3d12_backend_present(void);
 

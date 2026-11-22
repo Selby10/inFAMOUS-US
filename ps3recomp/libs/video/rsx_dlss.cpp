@@ -227,6 +227,8 @@ std::map<uint32_t, uint32_t> s_zeta_votes;
  * most of them agree on wins, so moving cars and people do not disturb it. */
 struct CamVote { uint32_t n; float m[16]; float zs, zo; };
 std::map<uint64_t, CamVote> s_cam_votes;
+float s_cam_last_constants[16];
+CamVote* s_cam_last_vote = nullptr;   /* map entries stay in place until cam_finish clears them */
 struct ObjT { float t[3]; uint32_t n; };
 std::map<uint64_t, ObjT> s_obj_cur, s_obj_prev;
 int s_obj_prev_valid = 0;
@@ -244,8 +246,13 @@ void cam_note(const rsx_dlss_draw_info* di)
     if (!di->cuse || !di->consts) return;
     const float* c = di->consts;
     if (uses(di->cuse, 263) && uses(di->cuse, 264) && uses(di->cuse, 265) && uses(di->cuse, 266)) {
-        const uint64_t h = fnv(c + 263 * 4, 64);
-        CamVote& v = s_cam_votes[h];
+        const float* camera = c + 263 * 4;
+        if (!s_cam_last_vote || memcmp(camera, s_cam_last_constants, sizeof s_cam_last_constants) != 0) {
+            const uint64_t h = fnv(camera, sizeof s_cam_last_constants);
+            s_cam_last_vote = &s_cam_votes[h];
+            memcpy(s_cam_last_constants, camera, sizeof s_cam_last_constants);
+        }
+        CamVote& v = *s_cam_last_vote;
         if (!v.n) {   /* columns c263..c266 -> row-major rows; z lane through the draw's viewport epilogue */
             for (int r = 0; r < 4; r++) for (int k = 0; k < 4; k++) v.m[r * 4 + k] = c[(263 + k) * 4 + r];
             v.zs = di->posscale[2]; v.zo = di->posoffset[2];
@@ -286,7 +293,10 @@ void cam_finish(Batch& b)
                 size_t n = 0;
                 for (const auto& e : d)
                     if (fabsf(e[0] - d[i][0]) < 0.5f && fabsf(e[1] - d[i][1]) < 0.5f && fabsf(e[2] - d[i][2]) < 0.5f) n++;
-                if (n > bn) { bn = n; bi = i; }
+                if (n > bn) {
+                    bn = n; bi = i;
+                    if (bn == d.size()) break;   /* no later candidate can win or replace the first tie */
+                }
             }
             if (bn >= 6 && bn * 3 >= d.size()) {
                 double s[3] = {0, 0, 0}; size_t n = 0;
@@ -306,6 +316,7 @@ void cam_finish(Batch& b)
     }
     s_obj_prev.swap(s_obj_cur); s_obj_cur.clear();
     s_obj_prev_valid = 1;
+    s_cam_last_vote = nullptr;
     s_cam_votes.clear();
 }
 

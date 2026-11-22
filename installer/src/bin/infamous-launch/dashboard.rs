@@ -35,6 +35,7 @@ struct Dashboard {
     backup: Option<String>,
     scope: Scope,
     restore: Option<(String, Scope)>,
+    save_transaction: Option<SaveTransaction>,
     trophy_catalog: Option<Result<trophy::Catalog, String>>,
     trophy_progress: Result<BTreeMap<u32, u64>, String>,
     update_check: Option<mpsc::Receiver<Result<setup::UpdateInfo, String>>>,
@@ -42,6 +43,40 @@ struct Dashboard {
 }
 
 use infamous_installer::save_manager;
+
+enum Snapshot {
+    Backup(Scope),
+    Restore(String, Scope),
+}
+
+struct SaveLists {
+    saves: Result<Vec<save_manager::Entry>, String>,
+    backups: Result<Vec<save_manager::Entry>, String>,
+}
+
+impl SaveLists {
+    fn read(manager: &save_manager::Manager) -> Self {
+        Self {
+            saves: manager.list_saves().map_err(|e| e.to_string()),
+            backups: manager.list_backups().map_err(|e| e.to_string()),
+        }
+    }
+}
+
+struct SnapshotCompletion {
+    result: Result<SnapshotOutcome, String>,
+    lists: SaveLists,
+}
+
+enum SnapshotOutcome {
+    BackedUp,
+    Restored(BTreeMap<String, String>),
+}
+
+struct SaveTransaction {
+    progress: &'static str,
+    completion: mpsc::Receiver<SnapshotCompletion>,
+}
 
 fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::none()
@@ -130,6 +165,7 @@ impl Dashboard {
             backup: None,
             scope: Scope::Saves,
             restore: None,
+            save_transaction: None,
             trophy_catalog: None,
             trophy_progress: Ok(BTreeMap::new()),
             update_check: None,
@@ -255,9 +291,11 @@ impl Dashboard {
         });
         card(ui, |ui| {
             ui.label(RichText::new("Quick settings").size(19.0).strong());
-            ui.columns(2, |cols| {
-                self.setting(&mut cols[0], &DISPLAY[0]);
-                self.setting(&mut cols[1], &DISPLAY[4]);
+            ui.add_enabled_ui(self.save_transaction.is_none(), |ui| {
+                ui.columns(2, |cols| {
+                    self.setting(&mut cols[0], &DISPLAY[0]);
+                    self.setting(&mut cols[1], &DISPLAY[4]);
+                });
             });
         });
     }
@@ -287,9 +325,12 @@ impl Dashboard {
     }
 
     fn refresh_saves(&mut self) {
-        let manager = self.state.launch.save_manager();
-        self.saves = manager.list_saves().map_err(|e| e.to_string());
-        self.backups = manager.list_backups().map_err(|e| e.to_string());
+        self.apply_save_lists(SaveLists::read(&self.state.launch.save_manager()));
+    }
+
+    fn apply_save_lists(&mut self, lists: SaveLists) {
+        self.saves = lists.saves;
+        self.backups = lists.backups;
         if let Ok(entries) = &self.backups {
             if self
                 .backup
@@ -317,33 +358,75 @@ impl Dashboard {
         }
     }
 
-    fn backup(&mut self, scope: Scope) {
-        let result = (|| {
-            let _lock = GameLock::acquire().map_err(|e| e.to_string())?;
-            self.state
-                .launch
-                .save_manager()
-                .backup(scope)
-                .map_err(|e| e.to_string())?;
-            Ok("Backup created.".into())
-        })();
-        self.notify(result);
-        self.refresh_saves();
+    fn start_save_transaction(&mut self, ctx: &egui::Context, snapshot: Snapshot) {
+        if self.save_transaction.is_some() {
+            return;
+        }
+        let progress = match snapshot {
+            Snapshot::Backup(_) => "Creating backup...",
+            Snapshot::Restore(..) => "Restoring backup...",
+        };
+        let launch = self.state.launch.clone();
+        let manager = launch.save_manager();
+        let repaint = ctx.clone();
+        let (send, completion) = mpsc::channel();
+        let worker = std::thread::Builder::new().spawn(move || {
+            let result = (|| {
+                let _lock = GameLock::acquire().map_err(|e| e.to_string())?;
+                match snapshot {
+                    Snapshot::Backup(scope) => {
+                        manager.backup(scope).map(|_| SnapshotOutcome::BackedUp)
+                    }
+                    Snapshot::Restore(name, scope) => manager
+                        .restore(&name, scope)
+                        .map(|_| SnapshotOutcome::Restored(State::read_ini(&launch))),
+                }
+                .map_err(|e| e.to_string())
+            })();
+            let lists = SaveLists::read(&manager);
+            let _ = send.send(SnapshotCompletion { result, lists });
+            repaint.request_repaint();
+        });
+        match worker {
+            Ok(_) => {
+                self.notice = None;
+                self.save_transaction = Some(SaveTransaction {
+                    progress,
+                    completion,
+                });
+                ctx.request_repaint();
+            }
+            Err(error) => self.notify(Err(format!("Could not start backup or restore: {error}"))),
+        }
     }
 
-    fn restore_backup(&mut self, name: &str, scope: Scope) {
-        let result = (|| {
-            let _lock = GameLock::acquire().map_err(|e| e.to_string())?;
-            self.state
-                .launch
-                .save_manager()
-                .restore(name, scope)
-                .map_err(|e| e.to_string())?;
-            self.state = State::new_for_restore(&self.state);
-            Ok("Restore complete. Recovery backup created.".into())
-        })();
-        self.notify(result);
-        self.refresh_saves();
+    fn poll_save_transaction(&mut self) {
+        let Some(transaction) = &self.save_transaction else {
+            return;
+        };
+        match transaction.completion.try_recv() {
+            Ok(completion) => {
+                self.save_transaction = None;
+                let notice = match completion.result {
+                    Ok(SnapshotOutcome::BackedUp) => Ok("Backup created.".into()),
+                    Ok(SnapshotOutcome::Restored(ini)) => {
+                        self.state.ini = ini;
+                        self.state.effective.clear();
+                        self.state.cur.clear();
+                        self.state.sync_rows();
+                        Ok("Restore complete. Recovery backup created.".into())
+                    }
+                    Err(error) => Err(error),
+                };
+                self.apply_save_lists(completion.lists);
+                self.notify(notice);
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.save_transaction = None;
+                self.notify(Err("Backup or restore stopped unexpectedly.".into()));
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
     }
 
     fn saves(&mut self, ui: &mut egui::Ui) {
@@ -371,10 +454,14 @@ impl Dashboard {
                 }
             }
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Open save folder").clicked() {
+                let idle = self.save_transaction.is_none();
+                if ui
+                    .add_enabled(idle, egui::Button::new("Open save folder"))
+                    .clicked()
+                {
                     self.open_data_folder(&manager.saves);
                 }
-                if ui.button("Refresh").clicked() {
+                if ui.add_enabled(idle, egui::Button::new("Refresh")).clicked() {
                     self.refresh_saves();
                 }
             });
@@ -390,15 +477,22 @@ impl Dashboard {
                 ] {
                     if ui
                         .add_enabled(
-                            !dirty || matches!(scope, Scope::Saves),
+                            self.save_transaction.is_none()
+                                && (!dirty || matches!(scope, Scope::Saves)),
                             egui::Button::new(label),
                         )
                         .clicked()
                     {
-                        self.backup(scope);
+                        self.start_save_transaction(ui.ctx(), Snapshot::Backup(scope));
                     }
                 }
-                if ui.button("Open backup folder").clicked() {
+                if ui
+                    .add_enabled(
+                        self.save_transaction.is_none(),
+                        egui::Button::new("Open backup folder"),
+                    )
+                    .clicked()
+                {
                     self.open_data_folder(&manager.backups);
                 }
             });
@@ -437,7 +531,10 @@ impl Dashboard {
                             }
                         });
                     if ui
-                        .add_enabled(!dirty, egui::Button::new("Restore selected backup..."))
+                        .add_enabled(
+                            !dirty && self.save_transaction.is_none(),
+                            egui::Button::new("Restore selected backup..."),
+                        )
                         .clicked()
                     {
                         if let Some(name) = self.backup.clone() {
@@ -674,6 +771,7 @@ impl eframe::App for Dashboard {
             self.update_result = Some(result);
             self.update_check = None;
         }
+        self.poll_save_transaction();
         egui::TopBottomPanel::top("tabs")
             .frame(
                 egui::Frame::none()
@@ -697,7 +795,7 @@ impl eframe::App for Dashboard {
                         if ui.selectable_label(self.tab == tab, label).clicked() && self.tab != tab
                         {
                             self.tab = tab;
-                            if tab == Tab::Saves {
+                            if tab == Tab::Saves && self.save_transaction.is_none() {
                                 self.refresh_saves();
                             }
                             if tab == Tab::Achievements {
@@ -717,7 +815,12 @@ impl eframe::App for Dashboard {
                 if self.restore.is_some() {
                     ui.disable();
                 }
-                if let Some((text, error)) = &self.notice {
+                if let Some(transaction) = &self.save_transaction {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(transaction.progress);
+                    });
+                } else if let Some((text, error)) = &self.notice {
                     ui.colored_label(if *error { AMBER } else { BLUE }, text);
                 }
                 ui.horizontal(|ui| {
@@ -732,7 +835,11 @@ impl eframe::App for Dashboard {
                             egui::Button::new(RichText::new(text).strong().color(BACKGROUND))
                                 .fill(BLUE)
                                 .min_size(egui::vec2(110.0, 33.0));
-                        if ui.add_enabled(self.readiness().is_ok(), play).clicked() {
+                        let idle = self.save_transaction.is_none();
+                        if ui
+                            .add_enabled(idle && self.readiness().is_ok(), play)
+                            .clicked()
+                        {
                             match self.state.play() {
                                 Ok(()) => {
                                     self.played.store(true, Ordering::Relaxed);
@@ -742,7 +849,10 @@ impl eframe::App for Dashboard {
                             }
                         }
                         if ui
-                            .add_enabled(self.state.dirty(), egui::Button::new("Save settings"))
+                            .add_enabled(
+                                idle && self.state.dirty(),
+                                egui::Button::new("Save settings"),
+                            )
                             .clicked()
                         {
                             let result = self.state.save().map(|()| "Settings saved.".into());
@@ -770,7 +880,11 @@ impl eframe::App for Dashboard {
                         .auto_shrink([false, false])
                         .show(ui, |ui| match self.tab {
                             Tab::Play => self.home(ui),
-                            Tab::Settings => self.settings(ui),
+                            Tab::Settings => {
+                                ui.add_enabled_ui(self.save_transaction.is_none(), |ui| {
+                                    self.settings(ui);
+                                });
+                            }
                             Tab::Saves => self.saves(ui),
                             Tab::Achievements => self.achievements(ui),
                             Tab::Support => self.support(ui),
@@ -794,10 +908,13 @@ impl eframe::App for Dashboard {
                             .clicked()
                         {
                             self.restore = None;
-                            self.restore_backup(&name, scope);
+                            self.start_save_transaction(ui.ctx(), Snapshot::Restore(name, scope));
                         }
                     });
                 });
+        }
+        if self.save_transaction.is_some() && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
     }
 }

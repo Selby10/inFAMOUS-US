@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 
 #include "rsx_ui_trainer.h"
 /* rsx_ui_trainer.h: the title's trainer page (F10); NULL = no trainer. */
@@ -31,6 +32,7 @@ const uiov_trainer_api* volatile g_uiov_trainer = 0;
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include "rsx_window_size.h"
 #include <d3d12.h>
 #include "rsx_d3d12_abi.h"   /* struct-returning D3D12 calls for every Windows SDK */
 #include <d3dcompiler.h>
@@ -116,7 +118,7 @@ static void lock(void)
 static void unlock(void) { LeaveCriticalSection(&s_cs); }
 
 static struct {
-    int active;               /* dialog on screen and owning input */
+    volatile int active;      /* dialog on screen and owning input */
     int kind;                 /* 1 = OK, 2 = YES/NO */
     int sel;                  /* 0 = first button (OK/Yes), 1 = No */
     int result;               /* 0 pending, 1 OK/YES, 2 NO -- read by the PPU side */
@@ -129,6 +131,7 @@ static struct {
     int last_kind, last_sel; char last_msg[2048];
 } D;
 static volatile ULONGLONG s_last_draw_ms;
+static volatile LONG s_shortcut_key;
 
 int uiov_dialog_available(void)
 {
@@ -146,6 +149,7 @@ void uiov_dialog_open(const char* msg, int kind, int default_no)
     strncpy(D.msg, msg ? msg : "", sizeof D.msg - 1);
     D.kind = kind; D.sel = (kind == 2 && default_no) ? 1 : 0; D.result = 0;
     D.t_open = GetTickCount64(); D.active = 1; D.prev = 0xFFFFFFFFu;   /* keys already down at open are ignored */
+    InterlockedExchange(&s_shortcut_key, 0);
     unlock();
     fprintf(stderr, "[uiov] dialog open (%s): %s\n", kind == 2 ? "yes/no" : "ok", msg ? msg : "");
 }
@@ -173,9 +177,23 @@ volatile int g_uiov_menu_open = 0;              /* read by cellPad.c (free the m
 static volatile int s_tr_open = 0;              /* F10 trainer page (render thread owns it) */
 static volatile ULONGLONG s_tr_close_ms = 0;
 static volatile int s_tr_need_clear = 0;
+extern volatile int g_savedata_slot_dialog_active;
+
+/* Win32 supplies key-down edges and clears pending input on focus loss. Keep
+ * one press until the next frame, provided its intended overlay owns input. */
+void uiov_queue_shortcut(UINT key)
+{
+    if (!key) {
+        InterlockedExchange(&s_shortcut_key, 0);
+        return;
+    }
+    if (D.active || g_savedata_slot_dialog_active) return;
+    if ((key == VK_F2 && !s_tr_open) || (key == VK_F10 && !s_menu_open))
+        InterlockedCompareExchange(&s_shortcut_key, (LONG)key, 0);
+}
+
 int uiov_pad_gate(void)
 {
-    extern volatile int g_savedata_slot_dialog_active;
     static int slot_was_open;
     static ULONGLONG slot_closed_ms;
     if (g_savedata_slot_dialog_active) { slot_was_open = 1; return 1; }
@@ -496,9 +514,10 @@ static int gfx_init(ID3D12Device* dev, DXGI_FORMAT rtfmt)
 
 /* ===========================================================================
  * v194 SETTINGS MENU (port overlay, same look as the system dialogs).
- * Open: F10 any time; while the game is paused (g_uiov_paused_fn, stubs.cpp: the game's world clock stopped while
- * its real clock runs = pause menu) a hint "F10 / Back  Settings & Quit" is shown -- controller Back or a click on
- * the hint opens it too. Up/Down select, Left/Right (or click / right click) change, Enter/A on a row, Esc/B close.
+ * F2 toggles Settings in the foreground game, including while paused. The pause
+ * menu has a Settings entry when the native patch is active, or a View/Back
+ * shortcut otherwise. Up/Down select, Left/Right or click change,
+ * and F2 or Esc/B closes the settings page.
  * Values live in settings.ini (current directory = infamous-recomp\ for every launcher); main.cpp loads it into the
  * environment at startup (it overrides the launcher). Live settings apply at once through the g_* hooks below;
  * the ones marked "restart" are read once at startup.
@@ -521,7 +540,7 @@ static MItem s_mi[] = {
     { "UI_FPS_CAP",      "Frame Rate Limit",   0, 9, { "0", "30", "40", "45", "50", "60", "120", "144", "240" }, { "Off", "30 FPS", "40 FPS", "45 FPS", "50 FPS", "60 FPS", "120 FPS", "144 FPS", "240 FPS" } },   /* v209b: Auto removed */
     { "KBM_GLYPHS",      "Button Prompts",     0, 6, { "1", "0", "2", "3", "4", "5" }, { "Automatic", "PlayStation", "Keyboard & Mouse", "Xbox", "Nintendo", "Steam Deck" } },
     { "PAD_MOUSE_SPEED", "Mouse Speed",        0, 5, { "900", "650", "450", "325", "225" }, { "1 (Slow)", "2", "3", "4", "5 (Fast)" } },
-    { "WINDOW_SIZE",     "Window Size",        1, 3, { "auto", "720p", "1080p" }, { "Match Game Resolution", "720p (1280 x 720)", "1080p (1920 x 1080)" } },
+    { "WINDOW_SIZE",     "Window Size",        0, 3, { "auto", "720p", "1080p" }, { "Match Game Resolution", "720p (1280 x 720)", "1080p (1920 x 1080)" } },
     { "RES_SCALE",       "Game Resolution",         1, 5, { "1", "1.5", "2", "2.5", "3" }, { "720p", "1080p", "1440p", "1800p", "2160p (4K)" } },
     { "SHADOWS",         "Shadows",            1, 2, { "1", "0" }, { "On", "Off" } },
     { "TEX_ANISO",       "Texture Filtering",  1, 5, { "-1", "0", "4", "8", "16" }, { "Game Default", "Bilinear", "4x Anisotropic", "8x Anisotropic", "16x Anisotropic" } },
@@ -552,18 +571,21 @@ static ULONGLONG s_menu_t_open;
 static unsigned s_menu_prev;
 static float s_row_y0[MR_N], s_row_y1[MR_N], s_row_x0, s_row_x1, s_hint_r[4];
 static int s_hint_on, s_menu_quitonly;
+static ULONGLONG s_pause_start_ms;
 static int s_wm_on; static ULONGLONG s_wm_last;   /* v238 pause watermark */
 static float s_cbtn[2][4];   /* v195: confirm buttons (mouse) */
 static int mi_match(const MItem* m, const char* v)
 {
     if (!v || !*v) return -1;
+    char* end = NULL;
+    const double scale = !strcmp(m->key, "RES_SCALE") ? strtod(v, &end) : 0.0;
     for (int i = 0; i < m->n; i++) {
         if (!strcmp(m->val[i], v)) return i;
-        if (!strcmp(m->key, "RES_SCALE") && fabs(atof(m->val[i]) - atof(v)) < 0.01) return i;
+        if (end && end != v && !*end && fabs(atof(m->val[i]) - scale) < 0.01) return i;
     }
     return -1;
 }
-static void menu_apply(int i, HWND hwnd)
+static void menu_apply(int i, HWND hwnd, int initializing)
 {
     const MItem* m = &s_mi[i]; const char* v = m->val[m->cur];
     _putenv_s(m->key, v);
@@ -572,25 +594,70 @@ static void menu_apply(int i, HWND hwnd)
     else if (!strcmp(m->key, "UI_FPS_CAP")) g_ui_fps_cap = atoi(v);
     else if (!strcmp(m->key, "KBM_GLYPHS")) g_ui_kbm_glyphs = atoi(v);
     else if (!strcmp(m->key, "PAD_MOUSE_SPEED")) g_ui_mouse_speed = atoi(v);
+    else if (!strcmp(m->key, "WINDOW_SIZE") && hwnd && !initializing) {
+        /* Startup already sized the window. Subsequent changes belong to its owner thread. */
+        if (!PostMessageA(hwnd, RSX_WM_WINDOW_SIZE, rsx_window_preset_from_setting(v), 0))
+            fprintf(stderr, "[settings] could not request window resize (%lu)\n", GetLastError());
+    }
 }
-static void menu_save(void)
+static int menu_copy_unchanged(FILE* in, FILE* out)
 {
-    FILE* f = fopen("settings.ini", "w");
-    if (!f) { fprintf(stderr, "[settings] could not write settings.ini\n"); return; }
-    fprintf(f, "; inFamous recomp settings (written by the in-game Settings menu, pause menu > Settings). Loaded at startup; overrides the launcher.\n");
-    for (int i = 0; i < MI_N; i++) fprintf(f, "%s=%s\n", s_mi[i].key, s_mi[i].val[s_mi[i].cur]);
-    fclose(f);
-    fprintf(stderr, "[settings] saved settings.ini\n");
+    char line[4096];
+    int at_line_start = 1, skip = 0, needs_newline = 0;
+    while (fgets(line, sizeof line, in)) {
+        if (at_line_start) {
+            skip = 0;
+            for (int i = 0; i < MI_N; i++) {
+                const MItem* m = &s_mi[i];
+                if (m->cur == m->saved) continue;
+                const size_t len = strlen(m->key);
+                if (!strncmp(line, m->key, len) && line[len] == '=') { skip = 1; break; }
+            }
+        }
+        const size_t len = strlen(line);
+        at_line_start = len && line[len - 1] == '\n';
+        if (!skip) {
+            if (fwrite(line, 1, len, out) != len) return 0;
+            needs_newline = !at_line_start;
+        }
+    }
+    return !ferror(in) && (!needs_newline || fputs("\r\n", out) >= 0);
+}
+
+static int menu_save(void)
+{
+    const char* path = "settings.ini";
+    FILE* in = fopen(path, "rb");
+    if (!in && errno != ENOENT) return 0;
+
+    char temp[MAX_PATH];
+    if (!GetTempFileNameA(".", "ifs", 0, temp)) {
+        if (in) fclose(in);
+        return 0;
+    }
+    FILE* out = fopen(temp, "wb");
+    int ok = out && (!in || menu_copy_unchanged(in, out));
+    if (in && fclose(in) != 0) ok = 0;
+    for (int i = 0; ok && i < MI_N; i++) {
+        const MItem* m = &s_mi[i];
+        if (m->cur != m->saved && fprintf(out, "%s=%s\r\n", m->key, m->val[m->cur]) < 0) ok = 0;
+    }
+    if (out && fclose(out) != 0) ok = 0;
+    if (ok) ok = MoveFileExA(temp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    if (!ok) DeleteFileA(temp);
+    return ok;
 }
 static void menu_init(HWND hwnd)
 {
     s_menu_inited = 1;
     for (int i = 0; i < MI_N; i++) {
         MItem* m = &s_mi[i];
-        int k = mi_match(m, getenv(m->key));
-        if (k < 0) {   /* not set: show the built-in default */
+        const char* value = getenv(m->key);
+        int k = mi_match(m, value);
+        if (!value || !*value) {
             if (!strcmp(m->key, "PAD_MOUSE_SPEED")) k = 2;
-            else if (!strcmp(m->key, "TEX_ANISO")) k = 0;
+            else if (!strcmp(m->key, "RES_SCALE")) k = 1;
+            else if (!strcmp(m->key, "UI_FPS_CAP")) k = 5;
             else k = 0;
         }
         m->cur = m->saved = k;
@@ -598,7 +665,8 @@ static void menu_init(HWND hwnd)
     /* live settings from settings.ini take effect now (restart ones were read at startup) */
     { FILE* f = fopen("settings.ini", "r");
       if (f) { fclose(f);
-          for (int i = 0; i < MI_N; i++) if (!s_mi[i].restart) menu_apply(i, hwnd); } }
+          for (int i = 0; i < MI_N; i++)
+              if (!s_mi[i].restart && s_mi[i].cur >= 0 && getenv(s_mi[i].key)) menu_apply(i, hwnd, 1); } }
 }
 static void menu_open(void)
 {
@@ -610,14 +678,20 @@ static void menu_close(void)
 {
     s_menu_open = 0; g_uiov_menu_open = 0; s_menu_close_ms = GetTickCount64(); s_menu_need_clear = 1; s_menu_quitonly = 0;
     int dirty = 0; for (int i = 0; i < MI_N; i++) if (s_mi[i].cur != s_mi[i].saved) dirty = 1;
-    if (dirty) { menu_save(); for (int i = 0; i < MI_N; i++) s_mi[i].saved = s_mi[i].cur; }
+    if (dirty) {
+        if (menu_save()) {
+            for (int i = 0; i < MI_N; i++) s_mi[i].saved = s_mi[i].cur;
+            fprintf(stderr, "[settings] saved settings.ini\n");
+        } else fprintf(stderr, "[settings] could not save settings.ini\n");
+    }
     fprintf(stderr, "[settings] menu closed\n");
 }
 static void menu_change(int i, int d, HWND hwnd)
 {
     MItem* m = &s_mi[i];
-    m->cur = (m->cur + d + m->n) % m->n;
-    menu_apply(i, hwnd);
+    if (m->cur < 0) m->cur = d > 0 ? 0 : m->n - 1;
+    else m->cur = (m->cur + d + m->n) % m->n;
+    menu_apply(i, hwnd, 0);
     if (m->restart) s_restart_note = 1;
     fprintf(stderr, "[settings] %s = %s%s\n", m->key, m->val[m->cur], m->restart ? " (after restart)" : "");
 }
@@ -632,65 +706,96 @@ static int mouse_virt(HWND hwnd, unsigned bbw, unsigned bbh, float* vx, float* v
     return 1;
 }
 /* returns 1 when the menu (or the hint) wants to draw this frame */
-static int menu_tick(HWND hwnd, unsigned bbw, unsigned bbh)
+static int menu_tick(HWND hwnd, unsigned bbw, unsigned bbh, int toggle)
 {
     ULONGLONG now = GetTickCount64();
-    if (!s_menu_inited) menu_init(hwnd);
-    const int fg = hwnd && GetForegroundWindow() == hwnd;
-    static int f10_was, sel_was, lb_was, rb_was;
-    const int f10 = 0;   /* F10 = trainer page now; Settings opens from the pause menu (g_uiov_request) */
-    const int paused = g_uiov_paused_fn ? g_uiov_paused_fn() : 0;
+    static int sel_was, lb_was, rb_was, fg_was;
+    if (s_menu_open && toggle && !s_menu_confirm) { menu_close(); return 0; }
     if (!s_menu_open) {
-        int open = f10 && !f10_was;
+        int open = toggle;
         /* v195: the pause menu's own "Settings" / "Quit Game" entries (native, stubs.cpp) ask for us */
         const int req = g_uiov_request;
         if (req) { g_uiov_request = 0; if (!D.active) open = req; }
-        /* v195: the old "F10 / Back" hint is gone (UI_PAUSE_HINT=1 brings it back) */
-        static int hint_env = -1;
-        if (hint_env < 0) { const char* e = getenv("UI_PAUSE_HINT"); hint_env = e && *e == '1'; }
-        s_hint_on = hint_env && paused && !D.active;
-        /* v238 pause-screen watermark, only on the real pause menu. "paused" (world clock stopped) is also true
-         * in cutscenes, so it is shown only if the pause menu was built shortly before or during this pause. */
-        { static int was_paused; static ULONGLONG t_pause;
-          if (paused && !was_paused) t_pause = now;
-          was_paused = paused;
-          const ULONGLONG built = g_pause_menu_built_ms;
-          s_wm_on = paused && built && built + 2000 >= t_pause && !D.active && !g_fs_cutscene_open; }
-        if (s_hint_on) {
-            unsigned in = read_input(hwnd);   /* only polled while paused (XInput on empty slots is slow) */
-            if ((in & IN_SELECT) && !sel_was) open = 1;
-            sel_was = (in & IN_SELECT) != 0;
-            const int lb = fg && (GetAsyncKeyState(VK_LBUTTON) & 0x8000);
+        const int paused = g_uiov_paused_fn ? g_uiov_paused_fn() : 0;
+        static int was_paused;
+        static ULONGLONG t_pause;
+        if (paused && !was_paused) t_pause = now;
+        const ULONGLONG built = g_pause_menu_built_ms;
+        const int pause_input = paused && !g_fs_cutscene_open && !D.active;
+        const int native_menu = built && built + 2000 >= t_pause;
+        s_wm_on = pause_input && native_menu;
+
+        /* The world clock also stops on the map. The Start report can precede
+         * the pause probe by several frames, so remember it across the delay. */
+        static unsigned pad_was = CELL_PAD_CTRL_START | CELL_PAD_CTRL_SELECT | CELL_PAD_CTRL_CIRCLE;
+        static int pause_from_start;
+        const unsigned pad = g_pad_title_digital;
+        const unsigned pressed = pad & ~pad_was;
+        pad_was = pad;
+        if (!was_paused && (pressed & CELL_PAD_CTRL_START)) s_pause_start_ms = now;
+        if (g_fs_cutscene_open || D.active) {
+            s_pause_start_ms = 0;
+            pause_from_start = 0;
+        } else if (!paused || !was_paused) {
+            if (pressed & (CELL_PAD_CTRL_SELECT | CELL_PAD_CTRL_CIRCLE)) s_pause_start_ms = 0;
+            pause_from_start = paused && s_pause_start_ms && now - s_pause_start_ms <= 1000;
+            if (paused) s_pause_start_ms = 0;
+        } else if (pressed & (CELL_PAD_CTRL_START | CELL_PAD_CTRL_CIRCLE)) {
+            /* A menu exit can lead straight to the map before the clock probe changes. */
+            pause_from_start = 0;
+        }
+        was_paused = paused;
+
+        enum { HINT_UNSET, HINT_AUTO, HINT_OFF, HINT_ON };
+        static int hint_mode = HINT_UNSET;
+        if (hint_mode == HINT_UNSET) {
+            const char* e = getenv("UI_PAUSE_HINT");
+            hint_mode = !e || !*e ? HINT_AUTO : (*e == '1' ? HINT_ON : HINT_OFF);
+        }
+        const int hint_was_on = s_hint_on;
+        s_hint_on = pause_input &&
+            (hint_mode == HINT_ON || (hint_mode == HINT_AUTO && pause_from_start && !native_menu));
+        if (s_hint_on && !open) {
+            /* Wait for a fresh press after showing the hint or returning from a modal. */
+            const int sel = (read_input(hwnd) & IN_SELECT) != 0;
+            if (hint_was_on && sel && !sel_was) open = 1;
+            sel_was = sel;
+            const int lb = hwnd && GetForegroundWindow() == hwnd && (GetAsyncKeyState(VK_LBUTTON) & 0x8000);
             float vx, vy;
-            if (lb && !lb_was && mouse_virt(hwnd, bbw, bbh, &vx, &vy) &&
+            if (hint_was_on && lb && !lb_was && mouse_virt(hwnd, bbw, bbh, &vx, &vy) &&
                 vx >= s_hint_r[0] && vx <= s_hint_r[2] && vy >= s_hint_r[1] && vy <= s_hint_r[3]) open = 1;
             lb_was = lb;
-        } else sel_was = 0;
-        f10_was = f10;
+        }
         if (open && !D.active) {
+            s_hint_on = 0;
+            s_pause_start_ms = 0;
             menu_open();
             if (open == 2) { s_menu_quitonly = 1; s_menu_confirm = 1; s_menu_csel = 1; }
         }
         else return s_hint_on || s_wm_on;
     }
     /* ---- menu input ---- */
+    const int fg = hwnd && GetForegroundWindow() == hwnd;
     unsigned in = read_input(hwnd);
-    if (s_menu_prev == 0xFFFFFFFFu) s_menu_prev = in;   /* keys held at open are ignored */
+    const int lb = fg && (GetAsyncKeyState(VK_LBUTTON) & 0x8000);
+    const int rb = fg && (GetAsyncKeyState(VK_RBUTTON) & 0x8000);
+    if (s_menu_prev == 0xFFFFFFFFu || (fg && !fg_was)) {
+        s_menu_prev = in;
+        lb_was = lb; rb_was = rb;
+    }
+    fg_was = fg;
     unsigned dn = in & ~s_menu_prev; s_menu_prev = in;
-    if (f10 && !f10_was) { f10_was = f10; menu_close(); return 0; }
-    f10_was = f10;
     if (now - s_menu_t_open < 150) dn = 0;
     if (s_menu_confirm) {
         if (dn & (IN_LEFT | IN_RIGHT | IN_UP | IN_DOWN | IN_TAB)) s_menu_csel ^= 1;
         if (dn & IN_BACK) { s_menu_confirm = 0; if (s_menu_quitonly) { menu_close(); return 0; } }
         { /* v195: mouse on the confirm buttons: hover selects, click activates */
-          static int clb_was; float vx, vy;
-          const int lb = fg && (GetAsyncKeyState(VK_LBUTTON) & 0x8000);
+          float vx, vy;
           if (mouse_virt(hwnd, bbw, bbh, &vx, &vy))
               for (int i = 0; i < 2; i++)
                   if (vx >= s_cbtn[i][0] && vx <= s_cbtn[i][2] && vy >= s_cbtn[i][1] && vy <= s_cbtn[i][3]) {
-                      s_menu_csel = i; if (lb && !clb_was) dn |= IN_OK; }
-          clb_was = lb; }
+                      s_menu_csel = i; if (lb && !lb_was) dn |= IN_OK; }
+          lb_was = lb; rb_was = rb; }
         if (dn & IN_OK) {
             if (s_menu_csel == 0) {   /* Quit: the v189c window-close path ends the process */
                 fprintf(stderr, "[settings] Quit Game\n");
@@ -715,7 +820,6 @@ static int menu_tick(HWND hwnd, unsigned bbw, unsigned bbh)
     }
     /* mouse: hover selects, left click = next value / activate, right click = previous value */
     { float vx, vy; static POINT s_last;
-      const int lb = fg && (GetAsyncKeyState(VK_LBUTTON) & 0x8000), rb = fg && (GetAsyncKeyState(VK_RBUTTON) & 0x8000);
       if (!s_menu_confirm && mouse_virt(hwnd, bbw, bbh, &vx, &vy) && vx >= s_row_x0 && vx <= s_row_x1) {
           POINT pt; GetCursorPos(&pt);
           for (int r = 0; r < MR_N; r++) if (vy >= s_row_y0[r] && vy <= s_row_y1[r]) {
@@ -726,7 +830,7 @@ static int menu_tick(HWND hwnd, unsigned bbw, unsigned bbh)
               if (rb && !rb_was && r < MI_N) menu_change(r, -1, hwnd);
           }
           s_last = pt;
-      } else if (s_menu_confirm && lb && !lb_was) { s_menu_csel ^= 0; }
+      }
       lb_was = lb; rb_was = rb; }
     return 1;
 }
@@ -750,7 +854,7 @@ static void build_watermark(void)
 }
 static void build_hint(void)
 {
-    const char* t = "Back   Settings & Quit";
+    const char* t = "F2 / Back   Settings";
     float sz = 22.0f, w = text_width(t, (int)strlen(t), sz), x1 = s_vw - 40.0f, x0 = x1 - w - 32.0f, y0 = 30.0f, y1 = y0 + 40.0f;   /* top-right: the game's pause screen keeps that black bar empty */
     float c0[4], c1[4], wt[4];
     rgba(c0, 0, 0, 0, 0.55f); rect(x0, y0, x1, y1, c0, c0, 0);
@@ -762,16 +866,17 @@ static void build_hint(void)
 static void build_menu(void)
 {
     static const float BLUE[3] = { 0.36f, 0.72f, 1.0f };
-    /* v243K: rows shrink when the list grows (720-unit virtual height): 40 units / 26 pt up to 11 rows */
-    const float rh = MR_N <= 11 ? 40.0f : (376.0f / (float)MR_N > 30.0f ? 376.0f / (float)MR_N : 30.0f);
-    const float cx = s_vw * 0.5f, lsz = rh * 0.65f;
+    const float cx = s_vw * 0.5f;
+    const float top = 92.0f, bot = UIOV_VW_H - 70.0f, fade = 30.0f;
+    const float rows_top = top + 62.0f, action_gap = 10.0f, restart_y = bot - 62.0f;
+    const float rh = fminf(40.0f, (restart_y - 12.0f - rows_top - action_gap) / MR_N);
+    const float lsz = rh * 0.65f;
     float c0[4], c1[4], wt[4], gr[4], bl[4];
     if (s_menu_quitonly) {   /* v195: "Quit Game" from the pause menu: only the confirmation */
         rgba(wt, 0.97f, 0.97f, 0.97f, 1); rgba(gr, 0.60f, 0.60f, 0.60f, 1); rgba(bl, BLUE[0], BLUE[1], BLUE[2], 1);
         goto confirm;
     }
     rgba(c0, 0, 0, 0, 0.55f); rect(0, 0, s_vw, UIOV_VW_H, c0, c0, 0);
-    const float top = 92.0f, bot = UIOV_VW_H - 70.0f, fade = 30.0f;
     rgba(c0, 0, 0, 0, 0); rgba(c1, 0, 0, 0, 0.86f);
     rect(0, top - fade, s_vw, top, c0, c1, 0); rect(0, top, s_vw, bot, c1, c1, 0); rect(0, bot, s_vw, bot + fade, c1, c0, 0);
     float lx0 = cx - 520.0f, lx1 = cx + 520.0f, ys[2] = { top, bot - 2.0f };
@@ -782,11 +887,12 @@ static void build_menu(void)
     rgba(wt, 0.97f, 0.97f, 0.97f, 1); rgba(gr, 0.60f, 0.60f, 0.60f, 1); rgba(bl, BLUE[0], BLUE[1], BLUE[2], 1);
     const char* title = "SETTINGS";
     text_draw(title, 8, cx - text_width(title, 8, 38.0f) * 0.5f, top + 14.0f, 38.0f, wt);
-    const float x0 = cx - 400.0f, x1 = cx + 400.0f;
+    const float half_width = fminf(400.0f, cx - 32.0f);
+    const float x0 = cx - half_width, x1 = cx + half_width;
     s_row_x0 = x0 - 20.0f; s_row_x1 = x1 + 20.0f;
-    float y = top + (MR_N <= 11 ? 72.0f : 62.0f);
+    float y = rows_top;
     for (int r = 0; r < MR_N; r++) {
-        if (r == MR_RESUME) y += MR_N <= 11 ? 14.0f : 6.0f;
+        if (r == MR_RESUME) y += action_gap;
         const int on = (r == s_menu_sel) && !s_menu_confirm;
         s_row_y0[r] = y - 4.0f; s_row_y1[r] = y + rh - 4.0f;
         if (on) { rgba(c0, BLUE[0], BLUE[1], BLUE[2], 0.0f); rgba(c1, BLUE[0], BLUE[1], BLUE[2], 0.22f);
@@ -798,7 +904,8 @@ static void build_menu(void)
             text_draw(m->label, (int)strlen(m->label), x0, y, lsz, col);
             if (m->restart) { const char* rs = "(restart)"; float lw = text_width(m->label, (int)strlen(m->label), lsz);
                               float g2[4]; rgba(g2, 0.45f, 0.45f, 0.45f, 1); text_draw(rs, 9, x0 + lw + 12.0f, y + rh * 0.15f, lsz * 0.7f, g2); }   /* v243K: scales with the row */
-            char v[96]; snprintf(v, sizeof v, "%s   %s   %s", on ? "<" : " ", m->name[m->cur], on ? ">" : " ");
+            const char* value = m->cur >= 0 ? m->name[m->cur] : "Custom";
+            char v[96]; snprintf(v, sizeof v, "%s   %s   %s", on ? "<" : " ", value, on ? ">" : " ");
             text_draw(v, (int)strlen(v), x1 - text_width(v, (int)strlen(v), lsz), y, lsz, on ? wt : gr);
         } else {
             const char* t = r == MR_RESUME ? "Back" : "Quit Game";
@@ -806,10 +913,10 @@ static void build_menu(void)
         }
         y += rh;
     }
-    const char* foot = s_menu_confirm ? "" : "Up/Down select    Left/Right or click change    Esc / B close";
+    const char* foot = s_menu_confirm ? "" : "Up/Down select    Left/Right or click change    F2 / Esc / B close";
     if (*foot) text_draw(foot, (int)strlen(foot), cx - text_width(foot, (int)strlen(foot), 19.0f) * 0.5f, bot - 34.0f, 19.0f, gr);
     if (s_restart_note) { const char* n = "Settings marked (restart) apply the next time the game starts.";
-        float y2[4]; rgba(y2, 1.0f, 0.82f, 0.35f, 1); text_draw(n, (int)strlen(n), cx - text_width(n, (int)strlen(n), 19.0f) * 0.5f, bot - 62.0f, 19.0f, y2); }
+        float y2[4]; rgba(y2, 1.0f, 0.82f, 0.35f, 1); text_draw(n, (int)strlen(n), cx - text_width(n, (int)strlen(n), 19.0f) * 0.5f, restart_y, 19.0f, y2); }
 confirm:
     if (s_menu_confirm) {
         const float lx0 = cx - 520.0f, lx1 = cx + 520.0f;
@@ -867,26 +974,30 @@ static void tr_close(void)
     fprintf(stderr, "[trainer] closed\n");
 }
 /* returns 1 when the page (or the active-cheat line) wants to draw this frame */
-static int tr_tick(HWND hwnd, unsigned bbw, unsigned bbh)
+static int tr_tick(HWND hwnd, unsigned bbw, unsigned bbh, int toggle)
 {
     const uiov_trainer_api* t = g_uiov_trainer;
-    static int f10_was, lb_was, rb_was;
+    static int lb_was, rb_was, fg_was;
     if (!t) { s_tr_hud_on = 0; if (s_tr_open) tr_close(); return 0; }
-    const int fg = hwnd && GetForegroundWindow() == hwnd;
-    const int f10 = fg && (GetAsyncKeyState(VK_F10) & 0x8000);
-    const int press = f10 && !f10_was;
-    f10_was = f10;
     if (!s_tr_open) {
-        if (press && !D.active && !s_menu_open) tr_open();
+        if (toggle && !D.active && !s_menu_open) tr_open();
         else { s_tr_hud_on = t->hud ? t->hud(s_tr_hud, sizeof s_tr_hud) : 0; return s_tr_hud_on; }
-    } else if (press) { tr_close(); return 0; }
+    } else if (toggle) { tr_close(); return 0; }
     s_tr_hud_on = 0;
     int n = t->count ? t->count() : 0; if (n > TR_MAX_ROWS) n = TR_MAX_ROWS;
     if (s_tr_sel < 0 || s_tr_sel >= n || !tr_selectable(t, s_tr_sel)) { s_tr_sel = -1; tr_move(t, n, +1); }
     /* keys / pad */
     const ULONGLONG now = GetTickCount64();
+    const int fg = hwnd && GetForegroundWindow() == hwnd;
+    const int lb = fg && (GetAsyncKeyState(VK_LBUTTON) & 0x8000);
+    const int rb = fg && (GetAsyncKeyState(VK_RBUTTON) & 0x8000);
     unsigned in = read_input(hwnd);
-    if (s_tr_prev == 0xFFFFFFFFu) s_tr_prev = in;   /* keys held at open are ignored */
+    if (s_tr_prev == 0xFFFFFFFFu || (fg && !fg_was)) {
+        s_tr_prev = in;
+        s_tr_rep_key = 0;
+        lb_was = lb; rb_was = rb;
+    }
+    fg_was = fg;
     unsigned dn = in & ~s_tr_prev; s_tr_prev = in;
     if (now - s_tr_t_open < 150) dn = 0;
     { const unsigned dirs = in & (IN_UP | IN_DOWN | IN_LEFT | IN_RIGHT);   /* held direction auto-repeat */
@@ -907,7 +1018,6 @@ static int tr_tick(HWND hwnd, unsigned bbw, unsigned bbh)
     if (dn & (IN_BACK | IN_SELECT)) { tr_close(); return 0; }
     /* mouse: hover selects, left click = next value / run, right click = previous value */
     { float vx, vy; static POINT s_last;
-      const int lb = fg && (GetAsyncKeyState(VK_LBUTTON) & 0x8000), rb = fg && (GetAsyncKeyState(VK_RBUTTON) & 0x8000);
       if (mouse_virt(hwnd, bbw, bbh, &vx, &vy) && vx >= s_tr_x0 && vx <= s_tr_x1) {
           POINT pt; GetCursorPos(&pt);
           for (int i = 0; i < n; i++) {
@@ -1071,11 +1181,28 @@ void uiov_render(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, D3D12_CPU_DES
 {
     fps_tick();   /* v212 */
     trophy_notice_tick();
-    /* v194: settings menu / pause hint (when no system dialog is up) */
-    if (!D.active && font_load()) {
+    UINT shortcut = s_shortcut_key ? (UINT)InterlockedExchange(&s_shortcut_key, 0) : 0;
+    if (shortcut && (!hwnd || GetForegroundWindow() != hwnd || IsIconic(hwnd))) shortcut = 0;
+    const int modal_active = D.active || g_savedata_slot_dialog_active;
+    /* Apply live settings even when the overlay font is unavailable. */
+    if (!modal_active && !s_menu_inited) menu_init(hwnd);
+
+    /* Settings and the trainer share input with one another and yield to dialogs. */
+    if (modal_active) {
+        s_hint_on = 0;
+        s_pause_start_ms = 0;
+        if (s_menu_open) s_menu_prev = 0xFFFFFFFFu;
+        if (s_tr_open) s_tr_prev = 0xFFFFFFFFu;
+    } else if (font_load()) {
         s_k = bbh / UIOV_VW_H; s_vw = bbw / s_k;
-        int want = s_menu_open ? 0 : tr_tick(hwnd, bbw, bbh);   /* F10 trainer page / active-cheat line */
-        if (!s_tr_open) want |= menu_tick(hwnd, bbw, bbh);
+        int want = 0;
+        if (!s_menu_open && (s_tr_open || (shortcut != VK_F2 && !g_uiov_request)))
+            want = tr_tick(hwnd, bbw, bbh, shortcut == VK_F10);
+        if (!s_tr_open) want |= menu_tick(hwnd, bbw, bbh, shortcut == VK_F2);
+        else {
+            s_hint_on = 0;
+            s_pause_start_ms = 0;
+        }
         if (want && gfx_init(dev, rtfmt)) {
             s_last_draw_ms = GetTickCount64();
             s_vbi = (s_vbi + 1) % UIOV_FRAMES;

@@ -30,6 +30,7 @@
 sys_fs_fd_info  g_sys_fs_fds[SYS_FS_FD_MAX];
 sys_fs_dir_info g_sys_fs_dirs[SYS_FS_DIR_MAX];
 char            g_sys_fs_root[512] = ".";
+extern const char* ppu_vfs_root;
 
 static void write_be32(uint32_t addr, uint32_t val)
 {
@@ -124,11 +125,16 @@ void ps3_vfs_ps3game_fallback(char* path, size_t cap)
 
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
 {
-    /* Lazily adopt PS3_VFS_ROOT if the root is still the default ".", so this
-     * sys_fs layer points at the same place as the cellFs layer (ppu_vfs_root). */
+    /* Share the boot harness's VFS root unless sys_fs has an explicit override. */
+    const char* root = g_sys_fs_root;
     if (g_sys_fs_root[0] == '.' && g_sys_fs_root[1] == '\0') {
         const char* env = getenv("PS3_VFS_ROOT");
-        if (env && *env) { strncpy(g_sys_fs_root, env, sizeof(g_sys_fs_root) - 1); g_sys_fs_root[sizeof(g_sys_fs_root)-1] = 0; }
+        if (env && *env) {
+            strncpy(g_sys_fs_root, env, sizeof(g_sys_fs_root) - 1);
+            g_sys_fs_root[sizeof(g_sys_fs_root) - 1] = '\0';
+        } else if (ppu_vfs_root && *ppu_vfs_root) {
+            root = ppu_vfs_root;
+        }
     }
 
     /* /dev_hdd0 overlays the installed game-update dir (patchN.farc live there
@@ -211,7 +217,7 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
         }
     }
 
-    snprintf(host_path, (size_t)host_path_size, "%s/%s", g_sys_fs_root, rel);
+    snprintf(host_path, (size_t)host_path_size, "%s/%s", root, rel);
     fs_normalize_sep(host_path);
     /* NOTE: do NOT stat() the direct path and fall back to the dev_hdd0 junction
      * on failure. stat() intermittently returns ENOENT for an existing file here
@@ -230,7 +236,7 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
         const char* usr = strstr(ps3_path, "/USRDIR/");
         if (usr) {
             char alt[1024];
-            snprintf(alt, sizeof(alt), "%s/extracted/USRDIR/%s", g_sys_fs_root, usr + 8);
+            snprintf(alt, sizeof(alt), "%s/extracted/USRDIR/%s", root, usr + 8);
             fs_normalize_sep(alt);
             if (stat(alt, &st) == 0)
                 snprintf(host_path, (size_t)host_path_size, "%s", alt);
@@ -254,7 +260,7 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
      * absolute but still means "relative to my USRDIR". */
     if (stat(host_path, &st) != 0) {
         char alt2[1024];
-        snprintf(alt2, sizeof(alt2), "%s/USRDIR/%s", g_sys_fs_root, rel);
+        snprintf(alt2, sizeof(alt2), "%s/USRDIR/%s", root, rel);
         fs_normalize_sep(alt2);
         if (stat(alt2, &st) == 0)
             snprintf(host_path, (size_t)host_path_size, "%s", alt2);

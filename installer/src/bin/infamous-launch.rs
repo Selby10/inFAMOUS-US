@@ -257,7 +257,7 @@ const DISPLAY: &[Row] = &[
     Row {
         key: "WINDOW_SIZE",
         label: "Window Size",
-        hint: "Windowed mode only. Larger windows fit your desktop. Changes need a restart.",
+        hint: "Fits your desktop in windowed mode. Also adjustable in-game.",
         vals: &["auto", "720p", "1080p"],
         names: &[
             "Match Game Resolution",
@@ -599,21 +599,23 @@ struct State {
     launch: Launch,
     /// Values on disk in settings.ini (all keys, incl. ones the window doesn't show).
     ini: BTreeMap<String, String>,
-    /// What the game would use right now for each shown key (index into the row's values).
+    /// The displayed choices at load or save. Reset removes entries for custom values
+    /// so they are saved even when the displayed choice does not change.
     effective: BTreeMap<&'static str, usize>,
     cur: BTreeMap<&'static str, usize>,
     features: Option<Features>,
 }
 
 impl State {
+    #[cfg(all(windows, not(feature = "gui")))]
     fn new_for_restore(old: &Self) -> Self {
         let mut state = Self::new(old.launch.clone());
         state.features = old.features;
         state.sync_rows();
         state
     }
-    fn new(launch: Launch) -> Self {
-        let ini = std::fs::read_to_string(launch.settings_path())
+    fn read_ini(launch: &Launch) -> BTreeMap<String, String> {
+        std::fs::read_to_string(launch.settings_path())
             .map(|t| {
                 t.lines()
                     .filter(|l| !l.starts_with(';') && !l.starts_with('#'))
@@ -621,7 +623,11 @@ impl State {
                     .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    fn new(launch: Launch) -> Self {
+        let ini = Self::read_ini(&launch);
         let features = cached_features(&launch.exe, &launch.cache_path());
         let mut s = Self {
             launch,
@@ -671,7 +677,7 @@ impl State {
 
     fn sync_rows(&mut self) {
         for r in self.groups().into_iter().flatten() {
-            if self.effective.contains_key(r.key) {
+            if self.cur.contains_key(r.key) {
                 continue;
             }
             let k = self
@@ -699,15 +705,15 @@ impl State {
     }
 
     fn save(&mut self) -> Result<(), String> {
-        let rows: Vec<&'static Row> = self.groups().into_iter().flatten().collect();
         let mut vals = self.ini.clone();
-        for (k, &i) in &self.cur {
-            if let Some(r) = rows.iter().find(|r| r.key == *k) {
-                vals.insert(k.to_string(), r.vals[i.min(r.vals.len() - 1)].to_string());
+        for row in self.groups().into_iter().flatten() {
+            let selected = self.get(row);
+            if self.effective.get(row.key) != Some(&selected) || !vals.contains_key(row.key) {
+                vals.insert(row.key.to_string(), row.vals[selected].to_string());
             }
         }
         let mut t = String::from(
-            "; inFamous recomp settings (written by the in-game Settings menu, F10). Loaded at startup; overrides the launcher.\n",
+            "; inFamous recomp settings (F2 or Pause > Settings in game). These values override launcher defaults at startup.\n",
         );
         for k in INI_ORDER {
             if let Some(v) = vals.get(*k) {
@@ -727,9 +733,17 @@ impl State {
     }
 
     fn restore_defaults(&mut self) {
-        for r in self.groups().into_iter().flatten() {
-            let d = self.default_index(r);
-            self.cur.insert(r.key, d);
+        for row in self.groups().into_iter().flatten() {
+            let default = self.default_index(row);
+            self.cur.insert(row.key, default);
+            if self.effective.get(row.key) == Some(&default)
+                && self
+                    .ini
+                    .get(row.key)
+                    .is_some_and(|value| value != row.vals[default])
+            {
+                self.effective.remove(row.key);
+            }
         }
     }
 
@@ -2056,5 +2070,104 @@ fn main() {
     };
     if settings_only && !played {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct SettingsFixture(PathBuf);
+
+    impl SettingsFixture {
+        fn new() -> Self {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "infamous-launch-settings-{}-{stamp}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn state(&self) -> State {
+            let launch = Launch {
+                root: self.0.clone(),
+                exe: self.0.join("game.exe"),
+                cwd: self.0.clone(),
+                args: Vec::new(),
+                env: [
+                    ("FULLSCREEN", "0"),
+                    ("PAD_MOUSE_SPEED", "650"),
+                    ("RES_SCALE", "1.5"),
+                    ("UPSCALER", "off"),
+                    ("UI_FPS_CAP", "120"),
+                ]
+                .map(|(key, value)| (key.into(), value.into()))
+                .into(),
+                out: None,
+                err: None,
+                settings_only: true,
+            };
+            fs::write(
+                launch.settings_path(),
+                "FULLSCREEN=0\nPAD_MOUSE_SPEED=500\nRES_SCALE=1.504\nUPSCALER=fsr_quality\nFSR_FG=1\nFUTURE_SETTING=keep\n",
+            )
+            .unwrap();
+            let mut state = State::new(launch);
+            state.set_features(Features {
+                dlss: true,
+                fsr: false,
+            });
+            state
+        }
+    }
+
+    impl Drop for SettingsFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(self.0.join("settings.ini"));
+            let _ = fs::remove_dir(&self.0);
+        }
+    }
+
+    #[test]
+    fn settings_save_preserves_custom_and_hidden_values() {
+        let fixture = SettingsFixture::new();
+        let mut state = fixture.state();
+        state.cur.insert("FULLSCREEN", 1);
+        state.save().unwrap();
+
+        let saved = State::read_ini(&state.launch);
+        assert_eq!(saved["FULLSCREEN"], "1");
+        assert_eq!(saved["PAD_MOUSE_SPEED"], "500");
+        assert_eq!(saved["RES_SCALE"], "1.504");
+        assert_eq!(saved["UPSCALER"], "fsr_quality");
+        assert_eq!(saved["FSR_FG"], "1");
+        assert_eq!(saved["FUTURE_SETTING"], "keep");
+        assert_eq!(saved["UI_FPS_CAP"], "120");
+        assert!(!state.dirty());
+    }
+
+    #[test]
+    fn settings_reset_replaces_custom_values_already_shown_as_defaults() {
+        let fixture = SettingsFixture::new();
+        let mut state = fixture.state();
+        assert!(!state.dirty());
+        state.restore_defaults();
+        assert!(state.dirty());
+        state.play().unwrap();
+
+        let saved = State::read_ini(&state.launch);
+        assert_eq!(saved["PAD_MOUSE_SPEED"], "650");
+        assert_eq!(saved["RES_SCALE"], "1.5");
+        assert_eq!(saved["UPSCALER"], "off");
+        assert_eq!(saved["FSR_FG"], "1");
+        assert_eq!(saved["FUTURE_SETTING"], "keep");
+        assert!(!state.dirty());
     }
 }

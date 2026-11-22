@@ -10,7 +10,8 @@
 +extern "C" void ps3_pad_rstick_read(uint32_t site, uint32_t which, uint32_t kind);   /* v236 (cellPad.c) */
 +extern "C" void car_v233_vis(ppu_context* ctx); extern "C" double car_v233_dscale(ppu_context* ctx);   /* v233A (car_v233.h) */
 +extern "C" void inf_cell_probe(uint32_t g, int32_t idx, int ready);   /* v151 (stubs.cpp) */
- 
+-
++extern "C" void infamous_trainer_flight(ppu_context* ctx);   /* trainer.cpp */
  /* Firmware-import HLE dispatch: a lifted import stub (a .lib.stub trampoline)
   * is replaced with a direct call to the registered HLE handler for its NID
 @@ -1009,13 +1015,13 @@ loc_0021EAC4:
@@ -43736,8 +43737,9 @@
 -        { uint64_t ea = ((ctx->gpr[29] + ctx->gpr[0])) & ~0xFULL; memcpy(vm_base + (uint32_t)ea, &ctx->vr[0], 16); }
 +        { uint64_t ea = ((ctx->gpr[29] + ctx->gpr[9])) & ~0xFULL; ppu_stvx16((uint32_t)ea, &ctx->vr[1]); }
 +        { uint64_t ea = ((ctx->gpr[29] + ctx->gpr[0])) & ~0xFULL; ppu_stvx16((uint32_t)ea, &ctx->vr[0]); }
++        infamous_trainer_flight(ctx);
          ctx->lr = 0x00350FE0; func_00353970(ctx); DRAIN_TRAMPOLINE(ctx);
-         /* nop */;
+-        /* nop */;
          ctx->gpr[0] = (int64_t)(int32_t)(0x60);
 @@ -351490,12 +351492,12 @@ loc_00351068:
          { uint64_t ea = ((ctx->gpr[9] + ctx->gpr[7])) & ~0xFULL; memcpy(&ctx->vr[0], vm_base + (uint32_t)ea, 16); }

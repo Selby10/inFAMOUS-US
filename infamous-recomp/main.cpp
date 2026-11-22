@@ -118,9 +118,7 @@ extern volatile long g_rsx_idle_wait;
  * toolkit's boot harness make. All three expose the same three entry points,
  * so the frame clock below is backend-agnostic. */
 #if defined(_WIN32)
-extern "C" int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title);
-extern "C" void rsx_d3d12_backend_present(void);
-extern "C" int  rsx_d3d12_backend_pump_messages(void);
+#include "rsx_d3d12_backend.h"
 extern "C" void rsx_d3d12_heartbeat(void);   /* [HEARTBEAT] every 10 s (HEARTBEAT=0 off) */
 #  define rsx_backend_init    rsx_d3d12_backend_init
 #  define rsx_backend_present rsx_d3d12_backend_present
@@ -282,6 +280,9 @@ static DWORD WINAPI frame_clock(LPVOID)
                     fprintf(stderr, "[boot] window closed -> exiting\n");
 #ifdef PORT_PGO_GEN
                     __llvm_profile_write_file();
+#endif
+#ifdef _WIN32
+                    rsx_d3d12_psolib_flush();
 #endif
                     fflush(NULL);
                     TerminateProcess(GetCurrentProcess(), 0);

@@ -5,9 +5,11 @@
 #include "sys_timer.h"
 #include "sys_event.h"
 #include "../memory/vm.h"
-#include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
-#include <string.h>
+#include "../platform/msvc_compat.h"
+#include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -73,6 +75,24 @@ uint64_t ppu_timebase_now(void)
 #endif
 }
 
+/* Use the absolute host clock so poll windows can be aligned with frame captures. */
+static unsigned long long timer_host_clock_us(void)
+{
+#ifdef _WIN32
+    static PPU_THREAD_LOCAL LARGE_INTEGER frequency;
+    LARGE_INTEGER now;
+    if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&now);
+    const unsigned long long ticks = (unsigned long long)now.QuadPart;
+    const unsigned long long hz = (unsigned long long)frequency.QuadPart;
+    return ticks / hz * 1000000ull + ticks % hz * 1000000ull / hz;
+#else
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (unsigned long long)now.tv_sec * 1000000ull + now.tv_nsec / 1000;
+#endif
+}
+
 static void write_be32(uint32_t addr, uint32_t val)
 {
     uint32_t* p = (uint32_t*)vm_to_host(addr);
@@ -99,6 +119,88 @@ static void write_be64(uint32_t addr, uint64_t val)
     *p = val;
 }
 
+enum { POLLTOP_MAX_SITES = 128, POLLTOP_REPORT_SITES = 8 };
+
+typedef struct {
+    uint64_t tid;
+    uint32_t lr;
+    unsigned long long calls, requested_us, elapsed_us;
+} polltop_site;
+
+/* 1 means the thread has yet to read PS3_POLLTOP, 0 disables profiling. */
+static PPU_THREAD_LOCAL unsigned long long t_polltop_interval_us = 1;
+
+static unsigned long long polltop_configured_interval_us(void)
+{
+    const char* setting = getenv("PS3_POLLTOP");
+    if (!setting) return 0;
+    char* end;
+    const long long seconds = strtoll(setting, &end, 10);
+    if (seconds <= 0 || *end || (unsigned long long)seconds > UINT64_MAX / 1000000ull)
+        return 0;
+    return (unsigned long long)seconds * 1000000ull;
+}
+
+static __forceinline void timer_host_sleep(uint64_t usec, int capped);
+
+static void polltop_sleep(ppu_context* ctx, uint64_t usec, int capped)
+{
+    static PPU_THREAD_LOCAL polltop_site sites[POLLTOP_MAX_SITES];
+    static PPU_THREAD_LOCAL unsigned used;
+    static PPU_THREAD_LOCAL unsigned long long window_start_us, dropped_calls;
+
+    const uint64_t tid = ctx->thread_id;
+    const uint32_t lr = (uint32_t)ctx->lr;
+    const unsigned long long requested_us = LV2_ARG_U64(ctx, 0);
+    const unsigned long long start_us = timer_host_clock_us();
+    timer_host_sleep(usec, capped);
+    const unsigned long long end_us = timer_host_clock_us();
+    const unsigned long long elapsed_us = usec ? end_us - start_us : 0;
+
+    if (!used) window_start_us = start_us;
+    unsigned i = 0;
+    /* A host thread may run multiple guest contexts that share an LR. */
+    for (; i < used; i++)
+        if (sites[i].tid == tid && sites[i].lr == lr) break;
+    if (i == used && used < POLLTOP_MAX_SITES) {
+        sites[i] = (polltop_site){ .tid = tid, .lr = lr };
+        used++;
+    }
+    if (i < used) {
+        sites[i].calls++;
+        sites[i].requested_us += requested_us;
+        sites[i].elapsed_us += elapsed_us;
+    } else {
+        dropped_calls++;
+    }
+
+    const unsigned long long duration_us = end_us - window_start_us;
+    if (duration_us < t_polltop_interval_us) return;
+#ifdef _WIN32
+    const unsigned long long host_tid = GetCurrentThreadId();
+#else
+    const unsigned long long host_tid = (uintptr_t)pthread_self();
+#endif
+    for (unsigned rank = 0; rank < POLLTOP_REPORT_SITES; rank++) {
+        polltop_site* best = NULL;
+        for (unsigned j = 0; j < used; j++)
+            if (sites[j].calls && (!best || sites[j].calls > best->calls)) best = &sites[j];
+        if (!best) break;
+        fprintf(stderr, "[POLLTOP] host_tid=%llu start_us=%llu end_us=%llu duration_us=%llu "
+                        "tid=%llu lr=0x%08X calls=%llu requested_us=%llu elapsed_us=%llu\n",
+                host_tid, window_start_us, end_us, duration_us, (unsigned long long)best->tid,
+                best->lr, best->calls, best->requested_us, best->elapsed_us);
+        best->calls = 0;
+    }
+    if (dropped_calls)
+        fprintf(stderr, "[POLLTOP_OVERFLOW] host_tid=%llu start_us=%llu end_us=%llu "
+                        "duration_us=%llu dropped_calls=%llu\n",
+                host_tid, window_start_us, end_us, duration_us, dropped_calls);
+    fflush(stderr);
+    used = 0;
+    dropped_calls = 0;
+}
+
 /* ---------------------------------------------------------------------------
  * sys_timer_usleep
  *
@@ -107,64 +209,9 @@ static void write_be64(uint32_t addr, uint64_t val)
 int64_t sys_timer_usleep(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
-    { extern unsigned long long ps3_qpc_us(void);
-      static int n=0; if ((n < 60 && n++ < 60))
-        fprintf(stderr, "[WAIT] t=%lluus timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n", ps3_qpc_us(),
+    { static int n=0; if ((n < 60 && n++ < 60))
+        fprintf(stderr, "[WAIT] t=%lluus timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n", timer_host_clock_us(),
         (unsigned long long)usec, (unsigned long long)ctx->lr, (unsigned long long)ctx->cia); }
-    /* PS3_POLLTOP=<seconds>: name the usleep poll sites.
-     *
-     * A title that is "hung" is usually not blocked on anything -- every thread
-     * is spinning on sys_timer_usleep waiting for a flag, and [BLOCKSUM] only
-     * says "syscall 141, 12s". This histograms the callers over a window and
-     * prints the top ones, so the answer is a guest address rather than a
-     * count. Keyed on ctx->lr: a host-stack backtrace through lifted code has
-     * no unwind tables and invents chains (see the Guitar Hero III writeup),
-     * and lr is the only guest chain that survives.
-     *
-     * Deliberately unlocked: the counts are a diagnostic, and a lost increment
-     * under a race cannot change which site is at the top of a 30k-per-second
-     * poll. */
-    { static long s_pt = -1;
-      if (s_pt < 0) { const char* e = getenv("PS3_POLLTOP");
-                      s_pt = e ? (long)strtoul(e, 0, 10) : 0;
-                      if (s_pt < 0) s_pt = 0; }
-      if (s_pt > 0) {
-        enum { PT_MAX = 128 };
-        static uint32_t pt_lr[PT_MAX]; static uint32_t pt_n[PT_MAX];
-        static uint64_t pt_us[PT_MAX]; static int pt_used = 0;
-        static uint32_t pt_tid[PT_MAX];
-        static unsigned long long pt_win = 0;
-        uint32_t lr = (uint32_t)ctx->lr;
-        int i = 0;
-        for (; i < pt_used; i++) if (pt_lr[i] == lr) break;
-        if (i == pt_used && pt_used < PT_MAX) {
-            pt_lr[pt_used] = lr;
-            /* The thread matters as much as the site: "who is waiting" is the
-             * half that says whether a poll is the engine idling or the main
-             * thread stuck. */
-            pt_tid[pt_used] = (uint32_t)ctx->thread_id;
-            pt_used++;
-        }
-        if (i < PT_MAX) { pt_n[i]++; pt_us[i] += usec; }
-        { extern unsigned long long ps3_qpc_us(void);
-          unsigned long long now = ps3_qpc_us();
-          if (!pt_win) pt_win = now;
-          else if (now - pt_win >= (unsigned long long)s_pt * 1000000ull) {
-            fprintf(stderr, "--- usleep poll sites (last %lds) ---\n", s_pt);
-            for (int k = 0; k < 8; k++) {
-              int best = -1;
-              for (int j = 0; j < pt_used; j++)
-                if (pt_n[j] && (best < 0 || pt_n[j] > pt_n[best])) best = j;
-              if (best < 0) break;
-              fprintf(stderr, "  %8u calls  %6llums slept  tid=%-3u lr=0x%08X\n",
-                      pt_n[best], (unsigned long long)(pt_us[best] / 1000),
-                      pt_tid[best], pt_lr[best]);
-              pt_n[best] = 0;
-            }
-            fflush(stderr);
-            for (int j = 0; j < pt_used; j++) { pt_n[j] = 0; pt_us[j] = 0; }
-            pt_win = now;
-          } } } }
 
     /* PS3_WAIT_OBJ=<lr-hex>: when a usleep spin is reached from this return
      * address, dump the registers and the object they point at. A poll loop
@@ -242,8 +289,21 @@ int64_t sys_timer_usleep(ppu_context* ctx)
       }
       for (int i = 0; i < s_cap_n; i++)
           if ((uint32_t)ctx->lr == s_cap_lr[i] && usec > s_cap_us[i]) { usec = s_cap_us[i]; capped = 1; break; } }
-    (void)capped;
+    /* PS3_POLLTOP=<seconds>: show the busiest guest sleep call sites. */
+    if (t_polltop_interval_us) {
+        if (t_polltop_interval_us == 1)
+            t_polltop_interval_us = polltop_configured_interval_us();
+        if (t_polltop_interval_us) {
+            polltop_sleep(ctx, usec, capped);
+            return CELL_OK;
+        }
+    }
+    timer_host_sleep(usec, capped);
+    return CELL_OK;
+}
 
+static __forceinline void timer_host_sleep(uint64_t usec, int capped)
+{
 #ifdef _WIN32
     /* Use high-resolution sleep via waitable timer for better precision */
     if (usec >= 1000 || capped) {
@@ -306,6 +366,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         }
     }
 #else
+    (void)capped;
     if (usec > 0) {
         struct timespec ts;
         ts.tv_sec  = (time_t)(usec / 1000000);
@@ -313,8 +374,6 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         nanosleep(&ts, NULL);
     }
 #endif
-
-    return CELL_OK;
 }
 
 /* ---------------------------------------------------------------------------

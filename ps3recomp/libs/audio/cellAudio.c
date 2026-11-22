@@ -1226,6 +1226,7 @@ static void audio_mix_loop_paced(void)
     { const char* e = getenv("AUDIO_ELASTIC_US"); if (e) elastic_us = atol(e); }
     uint64_t next = audio_now_ns();
     unsigned long long n_blocks = 0, n_silent = 0, n_skips = 0;
+    unsigned long long max_late_wait_us = 0;
     uint64_t stat_t0 = next;
     printf("[cellAudio] Mixing thread started (clock-paced, fifo prime=%d)\n", prime);
     /* v139 eager consumption (ABX 0x20; AUDIO_AHEAD_BLOCKS, default 14 = 75 ms of total queued audio): play137/138 [audio-ring] maps
@@ -1261,7 +1262,11 @@ static void audio_mix_loop_paced(void)
                 continue;
             }
         }
-        if (!eager && now - next > (uint64_t)AUDIO_MAX_CATCHUP_MS * 1000000ull) { next = now; n_skips++; late_t0 = 0; }
+        if (!eager && now - next > (uint64_t)AUDIO_MAX_CATCHUP_MS * 1000000ull) {
+            /* Resync the clock without restarting the wait for this guest block. */
+            next = now;
+            n_skips++;
+        }
 
         /* v60: wait (bounded) for a late guest block instead of playing a hole. */
         if (elastic_us && primed && !eager) {
@@ -1279,7 +1284,13 @@ static void audio_mix_loop_paced(void)
                     continue;
                 }
             }
-            if (late_t0) { s_n_late_waits++; s_late_wait_us += (now - late_t0) / 1000; late_t0 = 0; }
+            if (late_t0) {
+                unsigned long long wait_us = (now - late_t0) / 1000;
+                s_n_late_waits++;
+                s_late_wait_us += wait_us;
+                if (wait_us > max_late_wait_us) max_late_wait_us = wait_us;
+                late_t0 = 0;
+            }
         }
 
         { const unsigned long long g0 = s_n_late_gaps;
@@ -1320,16 +1331,19 @@ static void audio_mix_loop_paced(void)
               extern volatile int g_abx;   /* v132 */
               fprintf(stderr, "[audio-rate] %.1f blocks/s (187.5 = real time), silent %.1f%%, "
                       "device underrun pads %llu, drift drops %llu, clock skips %llu, fifo %u, device queued %d, "
-                      "late guest blocks waited %llu (%llu ms), late holes played %llu (concealed %llu, fade-ins %llu, stalled %llu, give-ups %llu, sentinel %d), eager %llu (abx 0x%02X)\n",
+                      "late guest blocks waited %llu (%llu ms), late holes played %llu (concealed %llu, fade-ins %llu, stalled %llu, give-ups %llu, sentinel %d), eager %llu (abx 0x%02X)"
+                      " start_ns=%llu end_ns=%llu max_late_wait_us=%llu\n",
                       n_blocks / sec, n_blocks ? 100.0 * n_silent / n_blocks : 0.0,
                       s_n_pads, s_n_drops, n_skips, s_fifo_w - s_fifo_r, audio_backend_queued(),
-                      s_n_late_waits, s_late_wait_us / 1000, s_n_late_gaps, s_n_plc_conceal, s_n_plc_fadein, s_n_stall, s_n_stall_giveup, s_sent, n_eager, g_abx);
+                      s_n_late_waits, s_late_wait_us / 1000, s_n_late_gaps, s_n_plc_conceal, s_n_plc_fadein, s_n_stall, s_n_stall_giveup, s_sent, n_eager, g_abx,
+                      (unsigned long long)stat_t0, (unsigned long long)now, max_late_wait_us);
               if (audio_stretch_on())
                   fprintf(stderr, "[audio-stretch] %llu steps, %llu stretched, +%.0f ms added, avg r %.3f, max r %.2f\n",
                           s_st_steps, s_st_sx_steps, s_st_added * 1000.0 / CELL_AUDIO_SAMPLE_RATE,
                           s_st_steps ? s_st_rsum / (double)s_st_steps : 1.0, s_st_rmax);
               s_st_steps = s_st_sx_steps = s_st_added = 0; s_st_rsum = 0; s_st_rmax = 0;
               n_blocks = n_silent = n_skips = 0; s_n_pads = s_n_drops = 0; stat_t0 = now;
+              max_late_wait_us = 0;
               s_n_late_waits = s_late_wait_us = s_n_late_gaps = 0; s_n_plc_conceal = s_n_plc_fadein = 0; s_n_stall = s_n_stall_giveup = 0; n_eager = 0;
           } }
     }

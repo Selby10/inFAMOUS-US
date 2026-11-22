@@ -121,7 +121,9 @@ static void infamous_hangdump_start(void)
 // v194: "is the game paused?" for the settings-menu hint (rsx_ui_overlay.c): the world clock (base+4) stands still
 // while the real clock (base+0x24) keeps running -- that is the pause menu (SIM-FROZEN in infamous_clock_probe.h).
 extern "C" int (*volatile g_uiov_paused_fn)(void);
+#ifndef _WIN32
 extern "C" __declspec(dllimport) unsigned long long __stdcall GetTickCount64(void);
+#endif
 static int infamous_paused_probe(void)
 {
     using infamous_clock_probe::word; using infamous_clock_probe::base;
@@ -157,8 +159,12 @@ static int infamous_paused_probe(void)
 extern "C" void ppu_register_function(uint64_t addr, void (*fn)(ppu_context*));
 extern "C" volatile int g_uiov_request;   /* rsx_ui_overlay.c */
 extern "C" volatile unsigned long long g_pause_menu_built_ms;   /* rsx_ui_overlay.c: pause watermark */
-struct inf_mbi { void* base; void* abase; unsigned long aprot; unsigned short part; size_t size; unsigned long state, prot, type; };
+#ifdef _WIN32
+using inf_mbi = MEMORY_BASIC_INFORMATION;
+#else
+struct inf_mbi { void* BaseAddress; void* abase; unsigned long aprot; unsigned short part; size_t RegionSize; unsigned long State, Protect, type; };
 extern "C" __declspec(dllimport) size_t __stdcall VirtualQuery(const void*, inf_mbi*, size_t);
+#endif
 
 static const uint32_t PM_FN_SETTINGS = 0x00FF0000u, PM_FN_QUIT = 0x00FF0010u, PM_FN_TRIM = 0x00FF0020u;
 static const uint32_t PM_TOC = INF_TITLE_TOC;
@@ -200,7 +206,7 @@ static bool pm_readable(uint32_t ea, uint32_t len)
 {
     for (uint64_t a = ea & ~0xFFFull; a < (uint64_t)ea + len; a += 0x1000) {
         inf_mbi m; if (!VirtualQuery(vm_base + a, &m, sizeof m)) return false;
-        if (m.state != 0x1000 || !m.prot || (m.prot & 0x101)) return false;
+        if (m.State != 0x1000 || !m.Protect || (m.Protect & 0x101)) return false;
     }
     return true;
 }
@@ -293,8 +299,8 @@ static void pm_thread()
         uint8_t* lo = vm_base + 0x40000000ull; uint8_t* hi = vm_base + 0x60000000ull;
         for (uint8_t* p = lo; p < hi && !(script_done && lq && ls);) {
             inf_mbi m; if (!VirtualQuery(p, &m, sizeof m)) break;
-            uint8_t* rb = (uint8_t*)m.base; uint8_t* re = rb + m.size; if (re > hi) re = hi;
-            const bool rd = m.state == 0x1000 && !(m.prot & 0x101) && m.prot;
+            uint8_t* rb = (uint8_t*)m.BaseAddress; uint8_t* re = rb + m.RegionSize; if (re > hi) re = hi;
+            const bool rd = m.State == 0x1000 && !(m.Protect & 0x101) && m.Protect;
             if (rd) {
                 for (uint8_t* q = (rb < p ? p : rb); q + 32 < re; q += 4) {
                     if (!script_done && q[0] == 0x01 && !std::memcmp(q, PM_ANCHOR_B, 16)) {
@@ -309,7 +315,7 @@ static void pm_thread()
                         else if (!std::memcmp(q, k_s, sizeof k_s)) { if (pm_patch_lang_at(q, sizeof k_s - 1, "Settings")) { ls = true; std::fprintf(stderr, "[pausemenu] text Settings @0x%08X\n", (uint32_t)(q - vm_base)); } }
                     }
             }
-            p = rb + m.size;
+            p = rb + m.RegionSize;
         }
         if (!(script_done && lq && ls)) std::this_thread::sleep_for(seconds(2));
     }

@@ -71,8 +71,11 @@ maintainer commands.
 
 Run **inFamous** (the shortcut Setup made). It opens a small options window first
 (vsync, frame cap, resolution, language and more, saved to `settings.ini`);
-**Play** starts the game. The same settings are in the game's pause menu under
-**Settings**. Controllers work as on the console, and keyboard and mouse are supported.
+**Play** starts the game. Press **F2** in the game window to open or close the
+same settings during play. With a controller, pause and choose **Settings**
+or press **View/Back** when the shortcut appears. Display mode, VSync, frame
+cap, button prompts, mouse speed, and Window Size apply during play. The overlay
+marks changes that need a game restart.
 
 Frame Rate Limit in the launcher and in-game settings supports Off, 30, 40, 45,
 50, 60, 120, 144 and 240 FPS. These are caps; achievable FPS depends on the scene
@@ -87,9 +90,10 @@ from **Game Resolution** in the launcher or in-game Settings:
 | Larger window with lighter rendering | 1080p (1920 x 1080) | 720p |
 
 Windows too large for the desktop are fitted while keeping their aspect ratio.
-Window Size and Game Resolution changes take effect after restarting the game.
-**Match Game Resolution** preserves the previous window-sizing behavior. Fullscreen
-uses the monitor; the Window Size choice is used when returning to windowed mode.
+Game Resolution changes take effect the next time the game starts. **Match Game
+Resolution** sizes the window for the current game resolution. Fullscreen uses
+the monitor. A Window Size change made in fullscreen applies when returning to
+windowed mode.
 
 ### Settings and save manager
 
@@ -175,8 +179,11 @@ selects, Backspace goes back, and W/A/S/D or the arrow keys move the cursor.
 
 **F10** opens the in-game trainer: God Mode, Infinite Energy, Refill Health,
 Max Health x2/x5/x10, Add XP, Karma +/-, Kill Enemies / Civilians, Super Speed
-and Player Model (play as Zeke, Trish, Kessler, Alden or John). Set `TRAINER=0`
-to turn it off.
+and Player Model (play as Zeke, Trish, Kessler, Alden or John). For repeatable
+test routes, **Testing → Mark Location** records a numbered location and
+timestamp in the game log. On the US release, enable **Testing → Flight** and
+hold L2 and Jump to ascend. Release either input to fall normally. Flight starts
+off each time you launch the game. Set `TRAINER=0` to turn the trainer off.
 
 ## DLSS and FSR (optional)
 

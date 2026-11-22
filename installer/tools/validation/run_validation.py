@@ -15,11 +15,15 @@ import time
 import tomllib
 
 from analyze_frames import analyze
+from analyze_host_frames import BACKGROUND_SCOPE, FOREGROUND_SCOPE, analyze_host_frames, validate_range
 
-# Existing renderer experiments, deliberately opt-in and recorded per run.
+# Existing profiling experiments recorded per run.
 PROFILE_OVERRIDES = {'BENCH_SHOT', 'TEXCS', 'TEXCS_THREADS', 'TEXCS_EARLY', 'TEXCS_PHASE',
                      'TEXCS_PHASE_DIV', 'TEXCS_ECORE', 'TEX_FAST_DECODE',
-                     'HITCH_MS', 'HITCH_MAX', 'SPIKE_MS', 'SPIKE_MAX'}
+                     'HITCH_MS', 'HITCH_MAX', 'SPIKE_MS', 'SPIKE_MAX', 'INFAMOUS_FPS_HIRES',
+                     'PS3_POLLTOP'}
+HOST_FRAME_ENV = 'INFAMOUS_HOST_PRESENT_FILE'
+HOST_BACKGROUND_ENV = 'INFAMOUS_HOST_PRESENT_INCLUDE_BACKGROUND'
 
 
 def utc():
@@ -29,7 +33,17 @@ def utc():
 def write_json(path, value):
     temporary = path.with_suffix('.tmp')
     temporary.write_text(json.dumps(value, indent=2), encoding='utf-8')
-    temporary.replace(path)
+    retry_count = 10
+    for attempt in range(retry_count + 1):
+        try:
+            temporary.replace(path)
+            return
+        except OSError as error:
+            # Windows readers without delete sharing can briefly block the rename.
+            if (attempt == retry_count or os.name != 'nt'
+                    or getattr(error, 'winerror', None) not in (5, 32, 33)):
+                raise
+            time.sleep(0.05)
 
 
 def command_output(args, cwd=None):
@@ -51,6 +65,7 @@ def launch_environment(manifest, hdd, mode, overrides):
     # These older runtime switches are enabled by presence, including "0".
     env.pop('D3D12_DBG', None)
     env.pop('D3D12_IQ', None)
+    env.pop('INFAMOUS_FPS_HIRES', None)
     # A manual capture must never inherit bench input or a persistent stick hold.
     for key in ('PAD_FILE', 'PAD_SCRIPT', 'PAD_AUTOPRESS', 'PAD_STICK'):
         env.pop(key, None)
@@ -65,6 +80,8 @@ def launch_environment(manifest, hdd, mode, overrides):
         if not separator or (key not in manifest['launch']['env'] and key not in PROFILE_OVERRIDES):
             raise ValueError('Overrides must name a manifest variable or documented profiling experiment: ' + item)
         env[key] = value
+    env.pop(HOST_FRAME_ENV, None)
+    env.pop(HOST_BACKGROUND_ENV, None)
     return env
 
 
@@ -101,9 +118,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--elf', type=Path, required=True)
+    parser.add_argument('--exe', type=Path, metavar='PATH',
+                        help='Game executable (default: <root>/infamous-recomp/build-install/inFamousRecomp.exe)')
     parser.add_argument('--hdd-root', type=Path, required=True)
     parser.add_argument('--output-root', type=Path, required=True)
-    parser.add_argument('--presentmon', type=Path)
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument('--presentmon', type=Path)
+    source.add_argument('--host-frames', action='store_true',
+                        help='Record successful foreground DXGI Presents without ETW or elevation')
+    parser.add_argument('--host-include-background', action='store_true',
+                        help='Include nonforeground DXGI Presents for unattended diagnostics')
+    parser.add_argument('--host-start', type=float, help='Start analysis this many seconds after host capture begins')
+    parser.add_argument('--host-end', type=float, help='End analysis this many seconds after host capture begins')
     parser.add_argument('--collector-direct', action='store_true', help='Use existing ETW permissions; never prompt for elevation')
     parser.add_argument('--hold-neutral', action='store_true', help='Hold centered scripted sticks for an idle baseline')
     parser.add_argument('--powershell', default=shutil.which('pwsh') or 'powershell.exe',
@@ -122,21 +148,41 @@ def main():
         parser.error('--hold-neutral requires --scripted-input')
     if args.seconds < 1:
         parser.error('--seconds must be positive')
+    if not args.host_frames and (args.host_start is not None or args.host_end is not None):
+        parser.error('--host-start and --host-end require --host-frames')
+    if args.host_include_background and not args.host_frames:
+        parser.error('--host-include-background requires --host-frames')
+    if args.host_frames and args.collector_direct:
+        parser.error('--collector-direct applies only to PresentMon')
+    host_start = args.host_start if args.host_start is not None else 0
+    try:
+        validate_range(host_start, args.host_end)
+    except ValueError as error:
+        parser.error(str(error))
     root = args.root.resolve(strict=True)
     port = root / 'infamous-recomp'
-    exe = port / 'build-install/inFamousRecomp.exe'
-    for required in (exe, args.elf, args.hdd_root):
+    default_exe = port / 'build-install/inFamousRecomp.exe'
+    exe = (args.exe if args.exe is not None else default_exe).resolve()
+    if not exe.is_file():
+        parser.error(f'Game executable is not a file: {exe}')
+    for required in (args.elf, args.hdd_root):
         if not required.exists():
             parser.error(f'Missing {required}')
     if args.presentmon and not args.presentmon.is_file():
         parser.error('PresentMon executable not found')
-    processes = command_output(['tasklist', '/FI', 'IMAGENAME eq inFamousRecomp.exe', '/FO', 'CSV'])
-    if 'inFamousRecomp.exe' in processes or processes == 'unavailable':
-        parser.error('Close existing game processes before starting validation')
+    for image_name in {default_exe.name.casefold(), exe.name.casefold()}:
+        processes = command_output(['tasklist', '/FI', f'IMAGENAME eq {image_name}', '/FO', 'CSV'])
+        if processes == 'unavailable' or f'"{image_name}",' in processes.casefold():
+            parser.error('Close existing game processes before starting validation')
     manifest = tomllib.loads((root / 'installer/infamous.toml').read_text(encoding='utf-8'))
     env = launch_environment(manifest, args.hdd_root.resolve(), args.mode, args.env)
     run = args.output_root.resolve() / dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f')
     run.mkdir(parents=True)
+    host_capture = run / 'host-frames.bin'
+    if args.host_frames:
+        env[HOST_FRAME_ENV] = str(host_capture)
+        if args.host_include_background:
+            env[HOST_BACKGROUND_ENV] = '1'
     configure_scripted_input(env, run, args.scripted_input)
     if args.hold_neutral:
         Path(env['PAD_FILE']).write_text('0 0 128 128 128 128', encoding='ascii')
@@ -150,16 +196,24 @@ def main():
         recorded_env[key] = env.get(key)
     for key in ('D3D12_DBG', 'D3D12_IQ'):
         recorded_env[key] = env.get(key)  # null means deliberately unset
+    frame_source = 'host_dxgi_present' if args.host_frames else 'presentmon_etw' if args.presentmon else None
+    host_scope = BACKGROUND_SCOPE if args.host_include_background else FOREGROUND_SCOPE
     record = dict(schema_version=1, status='starting', created_utc=utc(), scenario=args.scenario,
                   mode=args.mode, cache=args.cache, requested_seconds=args.seconds,
                   automatic_close=args.auto_close, hold_neutral=args.hold_neutral,
                   collector_direct=args.collector_direct,
+                  frame_capture_source=frame_source,
                   executable=str(exe), executable_sha256=hashlib.sha256(exe.read_bytes()).hexdigest(),
                   source_commit=command_output(['git', 'rev-parse', 'HEAD'], root),
                   source_changes=command_output(['git', 'diff', '--stat'], root),
                   os=platform.platform(), environment=recorded_env,
                   gpu=command_output(['nvidia-smi', '--query-gpu=name,driver_version', '--format=csv']),
                   cpu_temperature='not collected', gameplay_acceptance='pending manual validation')
+    if args.host_frames:
+        record['host_frames'] = dict(file=host_capture.name, start_s=host_start, end_s=args.host_end,
+                                     requested_timing_scope=host_scope)
+        recorded_env[HOST_FRAME_ENV] = env[HOST_FRAME_ENV]
+        recorded_env[HOST_BACKGROUND_ENV] = env.get(HOST_BACKGROUND_ENV)
     write_json(run / 'run.json', record)
     print(str(run), flush=True)
     # Cache renames are confined to this resolved port directory; never delete caches.
@@ -252,6 +306,22 @@ def main():
                     raise ValueError('Profiler did not complete successfully')
                 write_json(run / 'frames-summary.json', analyze(run / 'frames.csv', pid=game.pid))
                 record['capture_status'] = 'completed; includes startup, select gameplay intervals separately'
+            except (OSError, ValueError) as error:
+                record['capture_status'] = 'failed: ' + str(error)
+        elif args.host_frames:
+            try:
+                if not host_capture.exists():
+                    raise ValueError('No host Present capture file; check game logs and use a host-capture-enabled build')
+                host_summary = analyze_host_frames(host_capture, host_start, args.host_end, game.pid)
+                write_json(run / 'host-frames-summary.json', host_summary)
+                host_metadata = record['host_frames']
+                host_metadata['observed_timing_scope'] = host_summary['timing_scope']
+                if host_summary['timing_scope'] != host_scope:
+                    record['capture_status'] = 'failed: build did not honor the requested host timing scope'
+                elif host_summary['status'] == 'partial':
+                    record['capture_status'] = 'partial: ' + ', '.join(host_summary['warnings'])
+                else:
+                    record['capture_status'] = 'completed; host-supplied Presents only'
             except (OSError, ValueError) as error:
                 record['capture_status'] = 'failed: ' + str(error)
         else:

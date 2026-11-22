@@ -43,6 +43,7 @@ static int dlss_hooks_on(void) { static int on = -1; if (on < 0) on = rsx_dlss_h
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include "rsx_bench_present.h"
 
 /* D3D12 headers */
 #include <d3d12.h>
@@ -554,6 +555,7 @@ typedef struct {
     u32                   vp_gen;               /* bumped per VP recompile       */
     int                   vp_uses_c03;          /* VS references vp_c[0..3]      */
     VPTexSlot             vp_tex[VP_TEX_SLOTS]; /* per-frame VP texture slots    */
+    int                   vp_tex_extent;       /* render thread: one past the highest slot ever reserved */
     VPVSEntry             vp_vs[VP_VS_CACHE];   /* per-draw decompiled VS cache  */
     int                   vp_vs_n;
     VPFPEntry             vp_fp[VP_FP_CACHE];   /* guest-FP PSO cache            */
@@ -1286,9 +1288,79 @@ static u32    s_lock_n  = 0;
  * Win32 window
  * -----------------------------------------------------------------------*/
 
+#include "rsx_window_size.h"
+
+static SIZE fit_window_size(u32 width, u32 height, DWORD style, DWORD ex_style, const RECT* work)
+{
+    RECT frame = {0};
+    AdjustWindowRectEx(&frame, style, FALSE, ex_style);
+    const LONG frame_w = frame.right - frame.left, frame_h = frame.bottom - frame.top;
+    if (work && width && height) {
+        /* Keep the desktop margins used at startup, including room for the window frame. */
+        const LONG work_w = work->right - work->left, work_h = work->bottom - work->top;
+        const double max_w = fmin(work_w * 0.95, work_w - frame_w);
+        const double max_h = fmin(work_h * 0.90, work_h - frame_h);
+        const double scale = fmin(max_w / width, max_h / height);
+        if (scale > 0.0 && scale < 1.0) {
+            width = (u32)fmax(1.0, floor(width * scale));
+            height = (u32)fmax(1.0, floor(height * scale));
+        }
+    }
+    const SIZE size = { (LONG)width + frame_w, (LONG)height + frame_h };
+    return size;
+}
+
+static void apply_pending_window_size(HWND hwnd, rsx_window_preset* pending)
+{
+    if (*pending == RSX_WINDOW_PRESET_COUNT || g_win_fullscreen || IsIconic(hwnd) || IsZoomed(hwnd))
+        return;
+
+    const rsx_window_preset preset = *pending;
+    *pending = RSX_WINDOW_PRESET_COUNT; /* SetWindowPos can send WM_SIZE synchronously. */
+    MONITORINFO mi = {sizeof(mi)};
+    RECT current;
+    if (!GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi) ||
+        !GetWindowRect(hwnd, &current))
+        return;
+
+    u32 width, height;
+    rsx_window_dimensions(preset, BBW, BBH, &width, &height);
+    const RECT work = mi.rcWork;
+    const SIZE size = fit_window_size(width, height, (DWORD)GetWindowLongA(hwnd, GWL_STYLE),
+                                      (DWORD)GetWindowLongA(hwnd, GWL_EXSTYLE), &work);
+    const LONG x = max(work.left, min(current.left, work.right - size.cx));
+    const LONG y = max(work.top, min(current.top, work.bottom - size.cy));
+    if (!SetWindowPos(hwnd, NULL, x, y, size.cx, size.cy, SWP_NOZORDER | SWP_NOACTIVATE)) {
+        fprintf(stderr, "[WINDOW] live resize failed (%lu)\n", GetLastError());
+    } else if (GetClientRect(hwnd, &current)) {
+        fprintf(stderr, "[WINDOW] live resize requested %ux%u, client %ldx%ld\n",
+                width, height, current.right, current.bottom);
+    }
+}
+
 static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    static rsx_window_preset pending_size = RSX_WINDOW_PRESET_COUNT;
+    extern void uiov_queue_shortcut(UINT key);
+    if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && (wp == VK_F2 || wp == VK_F10) &&
+        !(lp & (1L << 29))) {  /* let the system handle Alt combinations */
+        if (!(lp & (1L << 30)) && GetForegroundWindow() == hwnd && !IsIconic(hwnd))
+            uiov_queue_shortcut((UINT)wp);
+        return 0;
+    }
     switch (msg) {
+    case RSX_WM_WINDOW_SIZE:
+        if (wp < RSX_WINDOW_PRESET_COUNT) {
+            pending_size = (rsx_window_preset)wp;
+            apply_pending_window_size(hwnd, &pending_size);
+        }
+        return 0;
+    case WM_SIZE:
+        if (wp == SIZE_RESTORED) apply_pending_window_size(hwnd, &pending_size);
+        break;
+    case WM_KILLFOCUS:
+        uiov_queue_shortcut(0);
+        break;
     case WM_ENTERSIZEMOVE:
     case WM_NCLBUTTONDOWN: {
         g_win_sizemove = 1;
@@ -1324,6 +1396,7 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
+        pending_size = RSX_WINDOW_PRESET_COUNT;
         PostQuitMessage(0);
         return 0;
     case WM_SYSCOMMAND:
@@ -1341,33 +1414,32 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         } else if (wp == VK_F1 && !(lp & (1 << 30))) {   /* v212: F1 = FPS counter on/off (rsx_ui_overlay.c) */
             extern volatile int g_uiov_show_fps; g_uiov_show_fps = !g_uiov_show_fps;
         } else if (wp == VK_F11 && !(lp & (1 << 30))) {   /* F11 = fullscreen (v212: F1 no longer) */
-            static int fs = 0; static WINDOWPLACEMENT wpl; static LONG style = 0;
-            if (!fs) {
+            static WINDOWPLACEMENT wpl; static LONG style = 0;
+            if (!g_win_fullscreen) {
                 MONITORINFO mi; mi.cbSize = sizeof mi;
                 wpl.length = sizeof wpl;
                 if (GetWindowPlacement(hwnd, &wpl) &&
                     GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
                     style = GetWindowLongA(hwnd, GWL_STYLE);
+                    g_win_fullscreen = 1;
                     SetWindowLongA(hwnd, GWL_STYLE, (style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
                     SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
                                  mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
                                  SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-                    fs = 1; g_win_fullscreen = 1;
                 }
             } else {
                 SetWindowLongA(hwnd, GWL_STYLE, style ? style : (WS_OVERLAPPEDWINDOW | WS_VISIBLE));
                 SetWindowPlacement(hwnd, &wpl);
                 SetWindowPos(hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
                              SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-                fs = 0; g_win_fullscreen = 0;
+                g_win_fullscreen = 0;
+                apply_pending_window_size(hwnd, &pending_size);
             }
         }
         return 0;
     }
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
-
-#include "rsx_window_size.h"
 
 static HWND create_window(u32 width, u32 height, const char* title)
 {
@@ -1380,18 +1452,9 @@ static HWND create_window(u32 width, u32 height, const char* title)
     wc.lpszClassName = "ps3recomp_d3d12";
     RegisterClassExA(&wc);
 
-    {   /* v154: a window larger than the screen's work area is shrunk (same aspect); DXGI scales the image */
-        RECT wa;
-        if (SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0)) {
-            const double mw = (double)(wa.right - wa.left) * 0.95, mh = (double)(wa.bottom - wa.top) * 0.90;
-            if (mw > 64 && mh > 64 && ((double)width > mw || (double)height > mh)) {
-                double k = mw / (double)width; if (mh / (double)height < k) k = mh / (double)height;
-                width = (u32)((double)width * k); height = (u32)((double)height * k);
-            }
-        }
-    }
-    RECT wr = {0, 0, (LONG)width, (LONG)height};
-    AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+    RECT work;
+    const BOOL have_work = SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0);
+    const SIZE size = fit_window_size(width, height, WS_OVERLAPPEDWINDOW, 0, have_work ? &work : NULL);
 
     /* Keep the display awake (see rsx_null_backend.c). */
     SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
@@ -1400,7 +1463,7 @@ static HWND create_window(u32 width, u32 height, const char* title)
         title ? title : "ps3recomp (D3D12)",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        wr.right - wr.left, wr.bottom - wr.top,
+        size.cx, size.cy,
         NULL, NULL, GetModuleHandle(NULL), NULL);
 }
 
@@ -2965,8 +3028,9 @@ typedef struct { unsigned long long h; char tgt[8]; u32 len; const u8* data; } S
 #define SHCP_CAP 16384u
 static ShcpEnt s_shcp[SHCP_CAP];
 static u32 s_shcp_n = 0;
-static volatile long s_shcp_dirty = 0;
+static int s_shcp_dirty = 0, s_shcp_preloaded = 0;
 static SRWLOCK s_shcp_lock = SRWLOCK_INIT;
+static SRWLOCK s_shcp_save_lock = SRWLOCK_INIT;
 static int s_shcp_cfg = -1, s_shcp_phase = -1;
 static volatile LONG64 s_shcp_cnt[2][3], s_shcp_tsc[2][3];   /* [parity][pack, file, compile] */
 static volatile LONG s_shcp_total = 0;
@@ -2982,7 +3046,7 @@ static u32 shcp_slot(unsigned long long h, const char* tgt)
     return SHCP_CAP;
 }
 /* data ownership passes to the table (never freed: the table lives for the process) */
-static int shcp_insert(unsigned long long h, const char* tgt, const u8* data, u32 len)
+static int shcp_insert(unsigned long long h, const char* tgt, const u8* data, u32 len, int already_packed)
 {
     if (!data || !len || strlen(tgt) >= 8) return 0;
     int ok = 0;
@@ -2993,7 +3057,7 @@ static int shcp_insert(unsigned long long h, const char* tgt, const u8* data, u3
             ShcpEnt* e = &s_shcp[i];
             e->h = h; memset(e->tgt, 0, sizeof e->tgt); memcpy(e->tgt, tgt, strlen(tgt)); e->len = len; e->data = data;
             s_shcp_n++; ok = 1;
-            s_shcp_dirty = 1;
+            if (!already_packed) s_shcp_dirty = 1;
         }
     }
     ReleaseSRWLockExclusive(&s_shcp_lock);
@@ -3022,28 +3086,64 @@ static int shcp_find(unsigned long long h, const char* tgt, ID3DBlob** out)
     ReleaseSRWLockShared(&s_shcp_lock);
     return r;
 }
+/* The caller holds its save lock while using the format's fixed temp path. */
+static int shader_cache_replace(const char* path, const char* tmp, const void* data, size_t size)
+{
+    FILE* f = fopen(tmp, "wb");
+    if (!f) return 0;
+    const int wrote = fwrite(data, 1, size, f) == size;
+    const int closed = fclose(f) == 0;
+    if (wrote && closed && MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) return 1;
+    DeleteFileA(tmp);
+    return 0;
+}
 static void shcp_save(void)
 {
-    AcquireSRWLockShared(&s_shcp_lock);
-    s_shcp_dirty = 0;
+    AcquireSRWLockExclusive(&s_shcp_save_lock);
+    AcquireSRWLockExclusive(&s_shcp_lock);
+    /* An early save could replace the pack before the preload has imported it. */
+    if (!s_shcp_preloaded || !s_shcp_dirty) {
+        ReleaseSRWLockExclusive(&s_shcp_lock);
+        ReleaseSRWLockExclusive(&s_shcp_save_lock);
+        return;
+    }
+    const u32 n = s_shcp_n;
+    ShcpEnt* entries = n ? (ShcpEnt*)malloc(n * sizeof *entries) : NULL;
     size_t total = 12;
-    for (u32 i = 0; i < SHCP_CAP; i++) if (s_shcp[i].data) total += 8 + 8 + 4 + s_shcp[i].len;
-    u8* b = (u8*)malloc(total);
-    u32 n = 0; size_t o = 12;
-    if (b) for (u32 i = 0; i < SHCP_CAP; i++) { const ShcpEnt* e = &s_shcp[i]; if (!e->data) continue;
-        memcpy(b + o, &e->h, 8); memcpy(b + o + 8, e->tgt, 8); memcpy(b + o + 16, &e->len, 4);
-        memcpy(b + o + 20, e->data, e->len); o += 20 + e->len; n++; }
-    ReleaseSRWLockShared(&s_shcp_lock);
-    if (!b) return;
-    const u32 magic = 0x50434853u, ver = 1u;
-    memcpy(b, &magic, 4); memcpy(b + 4, &ver, 4); memcpy(b + 8, &n, 4);
+    if (entries) {
+        /* Blob data is immutable and lives for the process. Copy just the entries under the lock. */
+        u32 j = 0;
+        for (u32 i = 0; i < SHCP_CAP; i++) {
+            if (!s_shcp[i].data) continue;
+            entries[j++] = s_shcp[i];
+            total += 20 + (size_t)s_shcp[i].len;
+        }
+    }
+    if (!n || entries) s_shcp_dirty = 0;
+    ReleaseSRWLockExclusive(&s_shcp_lock);
+
+    u8* b = (!n || entries) ? (u8*)malloc(total) : NULL;
     int ok = 0;
-    FILE* f = fopen("shadercache\\shcpack.bin.tmp", "wb");
-    if (f) { ok = fwrite(b, 1, o, f) == o; fclose(f);
-             if (ok) ok = MoveFileExA("shadercache\\shcpack.bin.tmp", "shadercache\\shcpack.bin", MOVEFILE_REPLACE_EXISTING) != 0;
-             else DeleteFileA("shadercache\\shcpack.bin.tmp"); }
+    if (b) {
+        const u32 magic = 0x50434853u, ver = 1u;
+        memcpy(b, &magic, 4); memcpy(b + 4, &ver, 4); memcpy(b + 8, &n, 4);
+        size_t o = 12;
+        for (u32 i = 0; i < n; i++) {
+            const ShcpEnt* e = &entries[i];
+            memcpy(b + o, &e->h, 8); memcpy(b + o + 8, e->tgt, 8); memcpy(b + o + 16, &e->len, 4);
+            memcpy(b + o + 20, e->data, e->len); o += 20 + (size_t)e->len;
+        }
+        ok = shader_cache_replace("shadercache\\shcpack.bin", "shadercache\\shcpack.bin.tmp", b, total);
+    }
     free(b);
-    fprintf(stderr, "[SHC_PACK] v235D wrote shadercache\\shcpack.bin: %u blobs, %.1f MB, %s%c", n, o / 1048576.0, ok ? "ok" : "FAILED", 10);
+    free(entries);
+    if (!ok) {
+        AcquireSRWLockExclusive(&s_shcp_lock);
+        s_shcp_dirty = 1;
+        ReleaseSRWLockExclusive(&s_shcp_lock);
+    }
+    fprintf(stderr, "[SHC_PACK] v235D wrote shadercache\\shcpack.bin: %u blobs, %.1f MB, %s%c", n, total / 1048576.0, ok ? "ok" : "FAILED", 10);
+    ReleaseSRWLockExclusive(&s_shcp_save_lock);
 }
 /* "<16 hex>_<target>.cso" -> hash + target */
 static int shcp_parse_name(const char* nm, unsigned long long* h, char* tgt)
@@ -3071,17 +3171,17 @@ static DWORD WINAPI shcp_thread(LPVOID p)
     FILE* f = fopen("shadercache\\shcpack.bin", "rb");
     if (f) {
         fseek(f, 0, SEEK_END); const long sz = ftell(f); fseek(f, 0, SEEK_SET);
-        u8* blob = (sz > 12) ? (u8*)malloc((size_t)sz) : NULL;
+        u8* blob = (sz >= 12) ? (u8*)malloc((size_t)sz) : NULL;
         if (blob && fread(blob, 1, (size_t)sz, f) == (size_t)sz) {
             u32 magic, ver, n; memcpy(&magic, blob, 4); memcpy(&ver, blob + 4, 4); memcpy(&n, blob + 8, 4);
-            if (magic == 0x50434853u && ver == 1u) {
+            if (magic == 0x50434853u && ver == 1u && (sz > 12 || n == 0)) {
                 had_pack = 1; packbytes = (size_t)sz;
                 size_t o = 12;
                 for (u32 k = 0; k < n && o + 20 <= (size_t)sz; k++) {
                     unsigned long long h; char tgt[9]; u32 len;
                     memcpy(&h, blob + o, 8); memcpy(tgt, blob + o + 8, 8); tgt[8] = 0; memcpy(&len, blob + o + 16, 4);
                     if (len == 0 || o + 20 + len > (size_t)sz) break;
-                    if (shcp_insert(h, tgt, blob + o + 20, len)) npack++;
+                    if (shcp_insert(h, tgt, blob + o + 20, len, 1)) npack++;
                     o += 20 + len;
                 }
             } else { free(blob); blob = NULL; }
@@ -3098,7 +3198,7 @@ static DWORD WINAPI shcp_thread(LPVOID p)
             if (!g) continue;
             fseek(g, 0, SEEK_END); const long n = ftell(g); fseek(g, 0, SEEK_SET);
             u8* d = (n > 0) ? (u8*)malloc((size_t)n) : NULL;
-            if (d && fread(d, 1, (size_t)n, g) == (size_t)n && shcp_insert(h, tgt, d, (u32)n)) nfile++;
+            if (d && fread(d, 1, (size_t)n, g) == (size_t)n && shcp_insert(h, tgt, d, (u32)n, 0)) nfile++;
             else free(d);
             fclose(g);
         } while (FindNextFileA(fh, &fd));
@@ -3107,8 +3207,13 @@ static DWORD WINAPI shcp_thread(LPVOID p)
     QueryPerformanceCounter(&q1);
     const double us = (double)(q1.QuadPart - q0.QuadPart) * 1e6 / (double)qf.QuadPart;
     if (us > 0) s_shcp_tpus = (double)(hz_tsc() - c0) / us;
+    AcquireSRWLockExclusive(&s_shcp_lock);
+    const u32 n = s_shcp_n;
+    s_shcp_preloaded = 1;
+    if (!had_pack) s_shcp_dirty = 1;
+    ReleaseSRWLockExclusive(&s_shcp_lock);
     fprintf(stderr, "[SHC_PACK] v235D preload: %u blobs from shcpack.bin (%.1f MB%s), %u loose .cso files, %u in memory, %.0f ms%c",
-            npack, packbytes / 1048576.0, had_pack ? "" : ", no pack yet", nfile, s_shcp_n, us / 1000.0, 10);
+            npack, packbytes / 1048576.0, had_pack ? "" : ", no pack yet", nfile, n, us / 1000.0, 10);
     if (nfile || !had_pack) shcp_save();
     return 0;
 }
@@ -3180,7 +3285,7 @@ static HRESULT cached_compile_impl(const char* src, size_t len, const char* name
                     if ((++hits % 500) == 1)
                         fprintf(stderr, "[SHADERCACHE] %u hits, %u compiles%c", hits, misses, 10);
                     if (shcp) { const u32 bl = (u32)(*out)->lpVtbl->GetBufferSize(*out); u8* cp = (u8*)malloc(bl);
-                                if (cp) { memcpy(cp, (*out)->lpVtbl->GetBufferPointer(*out), bl); if (!shcp_insert(h, target, cp, bl)) free(cp); } }
+                                if (cp) { memcpy(cp, (*out)->lpVtbl->GetBufferPointer(*out), bl); if (!shcp_insert(h, target, cp, bl, 0)) free(cp); } }
                     if (shcp_cfg()) shcp_note(1, shcp_t0);
                     return S_OK;
                 }
@@ -3201,7 +3306,7 @@ static HRESULT cached_compile_impl(const char* src, size_t len, const char* name
             if (ok) MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING); else DeleteFileA(tmp);
         }
         if (shcp) { const u32 bl = (u32)(*out)->lpVtbl->GetBufferSize(*out); u8* cp = (u8*)malloc(bl);
-                    if (cp) { memcpy(cp, (*out)->lpVtbl->GetBufferPointer(*out), bl); if (!shcp_insert(h, target, cp, bl)) free(cp); } }
+                    if (cp) { memcpy(cp, (*out)->lpVtbl->GetBufferPointer(*out), bl); if (!shcp_insert(h, target, cp, bl, 0)) free(cp); } }
     }
     if (on && shcp_cfg()) shcp_note(2, shcp_t0);
     return hr;
@@ -3698,38 +3803,45 @@ static ID3D12PipelineLibrary* s_psl = NULL;
 static ID3D12PipelineLibrary1* s_psl1 = NULL;
 static int s_psl_on = -1;
 static int s_psl_phase = -1;   /* v235D PSO_LIB_PHASE=0/1: library lookups/stores only on that A/B phase parity */
+static SRWLOCK s_psl_save_lock = SRWLOCK_INIT;
 static volatile LONG s_psl_dirty = 0;
 static void* s_psl_blob = NULL;   /* the library keeps referencing it */
 static volatile LONG s_psl_hit = 0, s_psl_miss = 0, s_psl_store = 0, s_psl_bad = 0;
 static void psl_save(const char* why)
 {
-    if (!s_psl || !InterlockedExchange(&s_psl_dirty, 0)) return;
+    AcquireSRWLockExclusive(&s_psl_save_lock);
+    /* StorePipeline sets dirty after publishing the entry. Changes during this save stay pending. */
+    if (!InterlockedExchange(&s_psl_dirty, 0)) {
+        ReleaseSRWLockExclusive(&s_psl_save_lock);
+        return;
+    }
+    LARGE_INTEGER f, t0, t1; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
     const SIZE_T n = s_psl->lpVtbl->GetSerializedSize(s_psl);
     void* b = n ? malloc(n) : NULL;
-    if (!b) return;
-    LARGE_INTEGER f, t0, t1; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
-    HRESULT hr = s_psl->lpVtbl->Serialize(s_psl, b, n);
     int ok = 0;
-    if (SUCCEEDED(hr)) {
-        FILE* o = fopen("shadercache\\psolib.bin.tmp", "wb");
-        if (o) { ok = fwrite(b, 1, n, o) == n; fclose(o);
-                 if (ok) ok = MoveFileExA("shadercache\\psolib.bin.tmp", "shadercache\\psolib.bin", MOVEFILE_REPLACE_EXISTING) != 0; }
+    if (b && SUCCEEDED(s_psl->lpVtbl->Serialize(s_psl, b, n))) {
+        ok = shader_cache_replace("shadercache\\psolib.bin", "shadercache\\psolib.bin.tmp", b, n);
     }
     free(b);
+    if (!ok) InterlockedExchange(&s_psl_dirty, 1);
     QueryPerformanceCounter(&t1);
     fprintf(stderr, "[PSOLIB] v225A saved (%s): %.1f MB, %s, %.0f ms; hits %ld, misses %ld, stored %ld%c", why, n / 1048576.0,
             ok ? "ok" : "FAILED", (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart,
             (long)s_psl_hit, (long)s_psl_miss, (long)s_psl_store, 10);
-    if (!ok) InterlockedExchange(&s_psl_dirty, 1);
+    ReleaseSRWLockExclusive(&s_psl_save_lock);
 }
 static DWORD WINAPI psl_save_thread(LPVOID p)
 {
     const DWORD ms = (DWORD)(uintptr_t)p;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    for (;;) { Sleep(ms); psl_save("periodic"); if (s_shcp_dirty) shcp_save(); }
+    for (;;) { Sleep(ms); psl_save("periodic"); shcp_save(); }
     return 0;
 }
-void rsx_d3d12_psolib_flush(void) { psl_save("exit"); if (s_shcp_dirty) shcp_save(); }   /* v225A: called from the exit paths when available */
+void rsx_d3d12_psolib_flush(void)
+{
+    psl_save("exit");
+    shcp_save();
+}
 static int psl_init(void)
 {
     if (s_psl_on >= 0) return s_psl_on;
@@ -5961,6 +6073,40 @@ static int vp_upload_tex_slot_impl(u32 off, u32 w, u32 h, u32 fmt, int cube, u32
     extern uint8_t* vm_base;
 
     if (!off || !w || !h || !vm_base || !s_d3d.srv_heap) return -1;
+    const u32 face_stride = cube ? rsx_texture_cube_face_stride(fmt, w, h, mips, 0) : 0;
+    const u32 key_off = off;         /* lookup key: the offset as bound */
+    /* Hashed hints: v227A keeps four recent candidates per bucket.  A candidate
+     * is only a hint; the full identity comparison below remains authoritative. */
+    u32 hh = (key_off * 2654435761u) ^ (w * 40503u) ^ (h * 2246822519u) ^ (fmt * 3266489917u) ^ (u32)cube ^ face_stride;
+    hh = (hh ^ (hh >> 15)) & 8191u;
+    const int assoc = tex_assoc_on();
+    int hint = -1;
+    const int nway = assoc ? TEX_ASSOC_WAYS : 1;
+    for (int way = 0; way < nway; way++) {
+        const int i = s_tex_assoc[hh][way] - 1;
+        if (i < 0 || i >= VP_TEX_SLOTS) continue;
+        const VPTexSlot* c = &s_d3d.vp_tex[i];
+        if (c->res && c->key == key_off && c->w == w && c->h == h && c->fmt == fmt &&
+            c->cube == cube && c->face_stride == face_stride) {
+            hint = i;
+            if (way == 0) s_tex_assoc_first++; else s_tex_assoc_extra++;
+            break;
+        }
+    }
+    if (hint < 0) s_tex_assoc_scan++;
+    { static u32 report_frame = 0;
+      if ((u32)(s_tex_frame - report_frame) >= 600u) {
+          report_frame = s_tex_frame;
+          fprintf(stderr, "[TEX_ASSOC] last 600 frames: first-way %llu, extra-way %llu, full scans %llu (mode %s)%c",
+                  (unsigned long long)s_tex_assoc_first, (unsigned long long)s_tex_assoc_extra,
+                  (unsigned long long)s_tex_assoc_scan, assoc ? "4-way" : "1-way", 10);
+          s_tex_assoc_first = s_tex_assoc_extra = s_tex_assoc_scan = 0;
+      } }
+    /* The hint already matched the full identity of this frame's binding. */
+    if (hint >= 0 && s_d3d.vp_tex[hint].used) {
+        tex_assoc_note(hh, hint, assoc);
+        return hint;
+    }
     /* Format classes (base = fmt & 0x9F). The LBP loading screen uses:
      * 0x85 A8R8G8B8 (swizzled UI art), 0x8B G8B8 (the 1024x2048 linear FONT
      * atlas -- without it no text renders at all), 0x86/87/88 DXT1/23/45
@@ -5995,43 +6141,14 @@ static int vp_upload_tex_slot_impl(u32 off, u32 w, u32 h, u32 fmt, int cube, u32
      * never Morton-swizzled on RSX). Row of blocks = (w/4)*blocksize. */
     u32 blkrow  = dxt ? tl.row_bytes : 0;
     u32 blkrows = dxt ? tl.rows      : 0;
-    const u32 face_stride = cube ? rsx_texture_cube_face_stride(fmt, w, h, mips, 0) : 0;
-    const u32 key_off = off;         /* lookup key: the offset as bound */
     /* Sparse checksum of a texture's source bytes -- enough to notice an
      * animated surface changing, cheap enough to run on every bind. */
     /* (portable helper tex_csum() -- see above; a statement-expression macro
      * here was a GCC/Clang extension MSVC rejects.) */
     #define TEX_CSUM(base, nbytes) tex_csum((base), (nbytes))
     int slot = -1, freeslot = -1;
-    /* Hashed hints: v227A keeps four recent candidates per bucket.  A candidate
-     * is only a hint; the full identity comparison below remains authoritative. */
-    u32 hh = (key_off * 2654435761u) ^ (w * 40503u) ^ (h * 2246822519u) ^ (fmt * 3266489917u) ^ (u32)cube ^ face_stride;
-    hh = (hh ^ (hh >> 15)) & 8191u;
-    const int assoc = tex_assoc_on();
-    int hint = -1;
-    const int nway = assoc ? TEX_ASSOC_WAYS : 1;
-    for (int way = 0; way < nway; way++) {
-        const int i = s_tex_assoc[hh][way] - 1;
-        if (i < 0 || i >= VP_TEX_SLOTS) continue;
-        const VPTexSlot* c = &s_d3d.vp_tex[i];
-        if (c->res && c->key == key_off && c->w == w && c->h == h && c->fmt == fmt &&
-            c->cube == cube && c->face_stride == face_stride) {
-            hint = i;
-            if (way == 0) s_tex_assoc_first++; else s_tex_assoc_extra++;
-            break;
-        }
-    }
-    if (hint < 0) s_tex_assoc_scan++;
-    { static u32 report_frame = 0;
-      if ((u32)(s_tex_frame - report_frame) >= 600u) {
-          report_frame = s_tex_frame;
-          fprintf(stderr, "[TEX_ASSOC] last 600 frames: first-way %llu, extra-way %llu, full scans %llu (mode %s)%c",
-                  (unsigned long long)s_tex_assoc_first, (unsigned long long)s_tex_assoc_extra,
-                  (unsigned long long)s_tex_assoc_scan, assoc ? "4-way" : "1-way", 10);
-          s_tex_assoc_first = s_tex_assoc_extra = s_tex_assoc_scan = 0;
-      } }
     for (int pass = 0; pass < 2 && slot < 0; pass++) {
-      int lo = 0, hi = VP_TEX_SLOTS;
+      int lo = 0, hi = s_d3d.vp_tex_extent;
       if (pass == 0) { if (hint < 0 || hint >= VP_TEX_SLOTS) continue; lo = hint; hi = hint + 1; }
       for (int i = lo; i < hi; i++) {
         VPTexSlot* c = &s_d3d.vp_tex[i];
@@ -6068,7 +6185,7 @@ static int vp_upload_tex_slot_impl(u32 off, u32 w, u32 h, u32 fmt, int cube, u32
      * is much more recent than the LRU one. */
     if (slot < 0) {
         int empty = -1, lru = -1, match = -1;
-        for (int i = 0; i < VP_TEX_SLOTS; i++) {
+        for (int i = 0; i < s_d3d.vp_tex_extent; i++) {
             VPTexSlot* c = &s_d3d.vp_tex[i];
             if (c->used) continue;
             if (!c->res) { if (empty < 0) empty = i; continue; }
@@ -6076,6 +6193,8 @@ static int vp_upload_tex_slot_impl(u32 off, u32 w, u32 h, u32 fmt, int cube, u32
             if (c->w == w && c->h == h && c->fmt == fmt && c->cube == cube
                 && (match < 0 || c->lru < s_d3d.vp_tex[match].lru)) match = i;
         }
+        if (empty < 0 && s_d3d.vp_tex_extent < VP_TEX_SLOTS)
+            empty = s_d3d.vp_tex_extent;
         /* v225B TEX_COLD_REUSE: traversal used to prefer an empty cache slot
          * while below TEX_CACHE_MB even when an old, unbound resource already
          * had the exact dimensions/format/cube layout.  A camera turn could
@@ -6214,6 +6333,7 @@ static int vp_upload_tex_slot_impl(u32 off, u32 w, u32 h, u32 fmt, int cube, u32
           fprintf(stderr, "[TEXSRC]    data starts at off%+ld (level0=%u bytes)%c",
                   start_delta, w * h * bpp, 10); } } }
     if (slot < 0) slot = freeslot;
+    if (slot == s_d3d.vp_tex_extent) s_d3d.vp_tex_extent++;
     if (slot >= 0) tex_assoc_note(hh, slot, assoc);
     VPTexSlot* t = &s_d3d.vp_tex[slot];
     /* The upload buffer's rows hold the DECODED image, so they are sized from
@@ -11533,10 +11653,19 @@ skip_dump_consider: ;
 
     /* Present */
     rft_mark(RFT_TAIL2);
-    if (s_rf_present)
-        { const UINT si = present_sync_interval();
-          const HRESULT ph = s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, si, (si == 0 && s_tearing_ok) ? DXGI_PRESENT_ALLOW_TEARING : 0); /* v209 tearing; v30e: PRESENT_VSYNC (default 0) */   /* skipped for an offscreen-only batch */
-          if (FAILED(ph)) d3d12_present_failed(ph); }
+    if (s_rf_present) {  /* skipped for an offscreen-only batch */
+        const UINT si = present_sync_interval();
+        const UINT flags = (si == 0 && s_tearing_ok) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+        HRESULT ph;
+        if (s_rsx_bench_present) {
+            const LONGLONG qpc = rsx_bench_present_begin(s_d3d.hwnd);
+            ph = s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, si, flags);
+            rsx_bench_present_end(qpc, ph);
+        } else {
+            ph = s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, si, flags);
+        }
+        if (FAILED(ph)) d3d12_present_failed(ph);
+    }
     rft_mark(RFT_PRESENT);
 
     move_to_next_frame();
@@ -15992,7 +16121,7 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
                  title ? title : "ps3recomp");
     }
     u32 window_w, window_h;
-    rsx_window_dimensions(getenv("WINDOW_SIZE"), BBW, BBH, &window_w, &window_h);
+    rsx_window_dimensions(rsx_window_preset_from_setting(getenv("WINDOW_SIZE")), BBW, BBH, &window_w, &window_h);
     s_d3d.hwnd = create_window(window_w, window_h, title);
     fprintf(stderr, "[WINDOW] requested %ux%u, render/output buffers %ux%u (desktop fit applied)\n",
             window_w, window_h, BBW, BBH);
@@ -16015,6 +16144,7 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
         printf("[D3D12] ERROR: D3D12 initialization failed\n");
         return -1;
     }
+    rsx_bench_present_init();
 
     /* Set up backend callbacks */
     s_d3d12_backend.userdata          = &s_d3d;

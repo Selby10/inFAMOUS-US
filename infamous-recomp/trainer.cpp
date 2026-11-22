@@ -10,14 +10,18 @@
  *   obj+0x8AC team id, obj+0x8C0 relation table {entries*, count} of {team, relation}; relation <= 2 = hostile
  *
  * Threading: the overlay calls row/status/hud/change on the render thread; they only read guest memory or set
- * atomics.  Every write and every guest call happens in trainer_tick() on the game's main PPU thread.
+ * atomics.  Guest writes and calls run on the game's PPU thread, in trainer_tick() or the movement hooks.
  */
 #include "infamous_region.h"
 #include "trainer.h"
 #include "rsx_ui_trainer.h"
 #include "ppu_recomp.h"
+#ifdef INFAMOUS_REGION_US
+#include "../ps3recomp/libs/input/cellPad.h"
+#endif
 
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -28,6 +32,9 @@ extern "C" {
 extern uint8_t* vm_base;
 extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;          /* ppu_loader.cpp */
 extern PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);     /* lifted code */
+#if defined(INFAMOUS_REGION_US) && defined(_WIN32)
+extern volatile int g_uiov_menu_open;                       /* rsx_ui_overlay.c */
+#endif
 }
 
 namespace {
@@ -97,13 +104,22 @@ uint32_t player_object()
     return best;
 }
 
-/* An actor with a plausible transform (vtable word, finite position, w == 1). */
-bool actor_ok(uint32_t obj)
+/* Read an actor's world position in centimeters (vtable word, finite position, w == 1). */
+bool read_actor_position(uint32_t obj, float (&position)[3])
 {
     if (!heap_ptr(obj) || !vtable_ok(vm_read32(obj))) return false;
     if (rdf(obj + kOffPos + 12) != 1.0f) return false;
-    for (int i = 0; i < 3; ++i) { const float v = rdf(obj + kOffPos + 4u * i); if (!std::isfinite(v) || std::fabs(v) > 1.0e7f) return false; }
+    for (int i = 0; i < 3; ++i) {
+        position[i] = rdf(obj + kOffPos + 4u * i);
+        if (!std::isfinite(position[i]) || std::fabs(position[i]) > 1.0e7f) return false;
+    }
     return true;
+}
+
+bool actor_ok(uint32_t obj)
+{
+    float position[3];
+    return read_actor_position(obj, position);
 }
 
 int relation_toward(uint32_t obj, uint32_t team)
@@ -752,18 +768,54 @@ enum { KILL_ENEMIES = 1, KILL_CIVILIANS = 2 };
 std::atomic<int> g_god{0};
 std::atomic<int> g_energy{0};
 std::atomic<int> g_speed{0};          /* index into kSpeedMult */
+#ifdef INFAMOUS_REGION_US
+std::atomic<int> g_flight{0};
+#endif
 std::atomic<int> g_maxhp{0};          /* index into kMaxHpMult */
 std::atomic<int> g_req_refill{0};
 std::atomic<int> g_req_kill{0};       /* KILL_* bits */
 std::atomic<int> g_req_xp{0};         /* number of +kXpStep presses */
 std::atomic<int> g_req_karma{0};      /* net +/- kKarmaStep presses */
+std::atomic<unsigned> g_req_mark{0};  /* number of Mark Location presses */
 std::atomic<int> g_res_xp{0};         std::atomic<long long> g_res_xp_ms{0};
 /* results of the last one-shot actions, shown in the row for a few seconds */
 std::atomic<int> g_res_refill{0};     std::atomic<long long> g_res_refill_ms{0};
 std::atomic<int> g_res_enemies{0};    std::atomic<long long> g_res_enemies_ms{0};
 std::atomic<int> g_res_civilians{0};  std::atomic<long long> g_res_civilians_ms{0};
+/* The sign records the outcome together with the marker number. */
+std::atomic<long long> g_res_mark{0};
+std::atomic<long long> g_res_mark_ms{0};
 
 /* ---- main-thread work ----------------------------------------------------------------------------------------- */
+void mark_location(uint32_t obj, unsigned requests)
+{
+    using namespace std::chrono;
+    static long long marker_id = 0;
+    float position[3];
+    const bool loaded = obj && vm_read32(obj) == kClassCole && read_actor_position(obj, position);
+    char coordinates[3][32]{};
+    if (loaded) {
+        for (int axis = 0; axis < 3; ++axis) {
+            char* field = coordinates[axis];
+            std::to_chars(field, field + sizeof coordinates[axis] - 1, position[axis]);
+        }
+    }
+    for (unsigned i = 0; i < requests; ++i) {
+        ++marker_id;
+        const long long mono_ms = now_ms();
+        const long long utc_ms = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+        if (loaded) {
+            std::fprintf(stderr, "[TRAINER_MARK] id=%lld mono_ms=%lld utc_ms=%lld status=ok x_cm=%s y_cm=%s z_cm=%s\n",
+                         marker_id, mono_ms, utc_ms, coordinates[0], coordinates[1], coordinates[2]);
+        } else {
+            std::fprintf(stderr, "[TRAINER_MARK] id=%lld mono_ms=%lld utc_ms=%lld status=unloaded\n",
+                         marker_id, mono_ms, utc_ms);
+        }
+        g_res_mark.store(loaded ? marker_id : -marker_id);
+        g_res_mark_ms.store(mono_ms);
+    }
+}
+
 int kill_matching(int which)
 {
     const uint32_t me = player_object();
@@ -788,8 +840,9 @@ int kill_matching(int which)
 
 void trainer_tick(void)
 {
-    if (!vm_base) return;
     const uint32_t obj = player_object();
+    if (const unsigned n = g_req_mark.exchange(0, std::memory_order_relaxed)) mark_location(obj, n);
+    if (!vm_base) return;
 
     /* Max health multiplier.  s_base = the game's own max.  If the game changes max while we hold it: a LOWER value
      * means it set max outright (respawn / recompute) -> that is the new base; a HIGHER value means it added to ours
@@ -906,6 +959,10 @@ enum Row {
     R_H_PROGRESS, R_XP, R_KARMA_GOOD, R_KARMA_EVIL,
     R_H_LOOK, R_MODEL, R_HIDE_COLE,
     R_H_WORLD, R_KILL_ENEMIES, R_KILL_CIVILIANS,
+    R_H_TESTING, R_MARK_LOCATION,
+#ifdef INFAMOUS_REGION_US
+    R_FLIGHT,
+#endif
     R_N
 };
 
@@ -972,6 +1029,21 @@ int api_row(int i, uiov_trainer_row* o)
         if (recent(g_res_civilians_ms)) { std::snprintf(v, sizeof v, "killed %d", g_res_civilians.load()); set(o, UIOV_TR_ACTION, "Kill Civilians", v); }
         else set(o, UIOV_TR_ACTION, "Kill Civilians");
         return 1;
+    case R_H_TESTING:  set(o, UIOV_TR_HEADER, "Testing"); return 1;
+    case R_MARK_LOCATION:
+        if (recent(g_res_mark_ms)) {
+            const long long result = g_res_mark.load();
+            std::snprintf(v, sizeof v, "#%lld %s", result > 0 ? result : -result, result > 0 ? "recorded" : "Cole unloaded");
+            set(o, UIOV_TR_ACTION, "Mark Location", v);
+        } else set(o, UIOV_TR_ACTION, "Mark Location");
+        return 1;
+#ifdef INFAMOUS_REGION_US
+    case R_FLIGHT: {
+        const int on = g_flight.load(std::memory_order_relaxed);
+        set(o, UIOV_TR_CHOICE, "Flight", on ? "On  (Hold L2 + Jump)" : "Off", on);
+        return 1;
+    }
+#endif
     default: return 0;
     }
 }
@@ -1011,6 +1083,14 @@ void api_change(int i, int dir)
     case R_KARMA_EVIL:     if (dir == 0) g_req_karma.fetch_sub(1); break;
     case R_KILL_ENEMIES:   if (dir == 0) g_req_kill.fetch_or(KILL_ENEMIES); break;
     case R_KILL_CIVILIANS: if (dir == 0) g_req_kill.fetch_or(KILL_CIVILIANS); break;
+    case R_MARK_LOCATION:  if (dir == 0) g_req_mark.fetch_add(1, std::memory_order_relaxed); break;
+#ifdef INFAMOUS_REGION_US
+    case R_FLIGHT: {
+        const int was_on = g_flight.fetch_xor(1, std::memory_order_relaxed);
+        std::fprintf(stderr, "[TRAINER] flight %s\n", was_on ? "OFF" : "ON");
+        break;
+    }
+#endif
     default: break;
     }
 }
@@ -1051,9 +1131,8 @@ const uiov_trainer_api kApi = { "TRAINER", api_count, api_row, api_change, api_s
  * normal numbers.  Both call sites are patched into recompiled/ppu_recomp_003.cpp (re-apply after a re-lift). */
 namespace {
 uint32_t s_mv_c = 0; bool s_mv_act = false; float s_mv_n[2] = {0, 0}, s_mv_w[2] = {0, 0};
-uint32_t cole_move_comp()
+uint32_t cole_move_comp(uint32_t obj)
 {
-    const uint32_t obj = player_object();
     if (!obj) return 0;
     const uint32_t c = vm_read32(obj + kOffMoveComp);
     return (heap_ptr(c) && vm_read32(c + kMoveOwner) == obj) ? c : 0;
@@ -1088,7 +1167,7 @@ extern "C" void infamous_trainer_move_set(ppu_context* ctx)
     const int k = g_speed.load(std::memory_order_relaxed);
     if (k <= 0) { s_mv_act = false; return; }
     const uint32_t c = (uint32_t)ctx->gpr[3];
-    if (!c || c != cole_move_comp()) return;
+    if (!c || c != cole_move_comp(player_object())) return;
     const float vx = vr_get(ctx, 2, 0), vy = vr_get(ctx, 2, 1);
     const float sp = std::sqrt(vx * vx + vy * vy);
     if (!std::isfinite(sp) || sp <= kSpeedMinRun) { s_mv_act = false; return; }
@@ -1097,6 +1176,30 @@ extern "C" void infamous_trainer_move_set(ppu_context* ctx)
     s_mv_c = c; s_mv_n[0] = vx; s_mv_n[1] = vy; s_mv_w[0] = vx * m; s_mv_w[1] = vy * m; s_mv_act = true;
     vr_set(ctx, 2, 0, s_mv_w[0]); vr_set(ctx, 2, 1, s_mv_w[1]);
 }
+
+#ifdef INFAMOUS_REGION_US
+/* The US movement update calls this immediately after the velocity store at 0x00350FD8. */
+extern "C" void infamous_trainer_flight(ppu_context* ctx)
+{
+    if (!g_flight.load(std::memory_order_relaxed)) return;
+#ifdef _WIN32
+    /* The last delivered pad report can predate the opening of the overlay. */
+    if (g_uiov_menu_open) return;
+#endif
+    constexpr unsigned chord = CELL_PAD_CTRL_L2 | CELL_PAD_CTRL_CROSS;
+    if ((g_pad_title_digital & chord) != chord) return;
+
+    const uint32_t component = static_cast<uint32_t>(ctx->gpr[29]);
+    if (!heap_ptr(component)) return;
+    const uint32_t obj = player_object();
+    if (!obj || component != cole_move_comp(obj)) return;
+    if (vm_read32(obj) != kClassCole || !(rdf(obj + kOffHp) > 0.0f) || !actor_ok(obj)) return;
+
+    constexpr uint32_t vertical_velocity = kMoveVel + 8;
+    constexpr float climb_speed_cm_s = 1024.0f;
+    wrf(component + vertical_velocity, climb_speed_cm_s);
+}
+#endif
 
 /* ---- freeze hook: the game's per-entity update.  func_00274630(entity) and its this-adjust thunk
  * func_004BA678 (r3 = entity + 0x68) are re-registered; only virtual calls (bctrl, target in ctr) come through here.

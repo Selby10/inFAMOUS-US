@@ -7,9 +7,15 @@
 #include <mutex>
 #include <thread>
 #include "../ps3recomp/runtime/ppu/ppu_store_observer.h"
-// v150: F7 cap toggle. Declared by hand (no <windows.h> in this header: stubs.cpp includes it).
+// v150: F7 cap toggle.
 #ifdef _WIN32
-extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int vKey);
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 static inline bool icp_f7_down() { return (GetAsyncKeyState(0x76) & 0x8000) != 0; }
 #else
 static inline bool icp_f7_down() { return false; }
@@ -91,6 +97,54 @@ static Clock::time_point cap_next{}, cap_win{};
 static unsigned cap_frames = 0, cap_slept_frames = 0; static double cap_slept_ms = 0;
 static bool sim_on = false;
 static bool cap_key = false, cap_active = true;   // v150: INFAMOUS_FPS_CAP_KEY=1 -> F7 toggles the cap live
+#ifdef _WIN32
+static HANDLE cap_waitable_timer;
+
+static void cap_hires_init()
+{
+    const char* setting = std::getenv("INFAMOUS_FPS_HIRES");
+    if (!setting || std::strcmp(setting, "1") != 0) return;
+
+    // The cap runs on the main PPU thread, so a single one-shot timer can be reused.
+    cap_waitable_timer = CreateWaitableTimerExW(nullptr, nullptr,
+        0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_MODIFY_STATE | SYNCHRONIZE);
+    if (cap_waitable_timer)
+        std::fprintf(stderr, "[FPSCAP] high-resolution waitable timer enabled (INFAMOUS_FPS_HIRES=1)\n");
+    else
+        std::fprintf(stderr, "[FPSCAP] high-resolution waitable timer unavailable (Win32 %lu), using standard sleep\n",
+                     GetLastError());
+}
+
+static void cap_hires_wait_until(Clock::time_point wake)
+{
+    using namespace std::chrono;
+    using HundredNs = duration<LONGLONG, std::ratio<1, 10000000>>;
+    const auto delay = duration_cast<HundredNs>(wake - Clock::now());
+    if (delay.count() <= 0) return;
+
+    LARGE_INTEGER due;
+    due.QuadPart = -delay.count();  // negative means relative, in 100 ns units
+    DWORD error;
+    if (SetWaitableTimer(cap_waitable_timer, &due, 0, nullptr, nullptr, FALSE)) {
+        const DWORD timeout = static_cast<DWORD>(ceil<milliseconds>(delay).count() + 2);
+        const DWORD result = WaitForSingleObject(cap_waitable_timer, timeout);
+        if (result == WAIT_OBJECT_0) return;
+        if (result == WAIT_TIMEOUT) {
+            // A missed wake only affects this frame. The next frame rearms the timer.
+            std::this_thread::sleep_until(wake);
+            return;
+        }
+        error = GetLastError();
+    } else {
+        error = GetLastError();
+    }
+    CloseHandle(cap_waitable_timer);
+    cap_waitable_timer = nullptr;
+    std::fprintf(stderr, "[FPSCAP] high-resolution waitable timer failed (Win32 %lu), using standard sleep\n", error);
+    std::this_thread::sleep_until(wake);
+}
+#endif
+
 static void cap_pace_inner()
 {
     {   // v194: the settings menu's Frame Rate Limit wins over F7 / the launcher
@@ -119,7 +173,14 @@ paced:
     if (cap_next == Clock::time_point{} || now > cap_next + 2 * cap_period) cap_next = now;   // first frame / after a hitch: resync
     else if (now < cap_next) {
         const Clock::duration rem = cap_next - now;
-        if (rem > std::chrono::microseconds(1500)) std::this_thread::sleep_for(rem - std::chrono::microseconds(1500));
+        constexpr auto yield_margin = std::chrono::microseconds(1500);
+        if (rem > yield_margin) {
+#ifdef _WIN32
+            if (cap_waitable_timer) cap_hires_wait_until(cap_next - yield_margin);
+            else
+#endif
+                std::this_thread::sleep_for(rem - yield_margin);
+        }
         while (Clock::now() < cap_next) std::this_thread::yield();
         cap_slept_frames++; cap_slept_ms += std::chrono::duration<double, std::milli>(rem).count();
     }
@@ -243,6 +304,9 @@ static void init()
     start = Clock::now();
     if (cap_fps >= 5.0 && cap_fps <= 240.0) {
         cap_period = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(1.0 / cap_fps));
+#ifdef _WIN32
+        cap_hires_init();
+#endif
         mark_line(base);   // the raw-dt store must leave the inline fast path to reach the observer
         s_coh_armed = 1;
         g_ppu_store_observer = {base, 0x74, observe_all};
