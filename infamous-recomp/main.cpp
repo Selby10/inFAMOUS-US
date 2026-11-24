@@ -1024,6 +1024,7 @@ int main(int argc, char** argv)
     }
 
     derive_vfs_root(argv[1]);
+    set_default_env("PS3_HDD0_ROOT", ppu_vfs_root);
     printf("[boot] VFS root: %s\n", ppu_vfs_root);
 
     /* Initialize cellGame before the guest asks for its HDD content directory.
