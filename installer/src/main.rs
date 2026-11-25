@@ -655,11 +655,14 @@ fn cmd_update(s: &Session) -> Result<()> {
             update::summary(&plan)
         ));
     }
+    if let Some(note) = availability.maintenance_note() {
+        util::info(note);
+    }
     if s.o.check {
-        // One machine-readable line for the setup program.
+        // Older Setup versions treat "available" as any work the updater can perform.
         println!(
             "UPDATE-CHECK {} {} {} {}",
-            if availability.available {
+            if availability != update::Availability::Current {
                 "available"
             } else {
                 "current"
@@ -670,23 +673,17 @@ fn cmd_update(s: &Session) -> Result<()> {
         );
         return Ok(());
     }
-    if !availability.available {
+    if availability == update::Availability::Current {
         util::heading("Done");
         util::info("Nothing to do.");
         return Ok(());
     }
 
     if !plan.is_empty() {
-        util::heading("Downloading the update");
+        util::heading("Applying file changes");
         util::write_file(&pending_marker, plan.commit.as_bytes())?;
         update::apply(&s.root, &remote, &plan, &mut |l| util::info(&l))?;
         util::info(&format!("Files updated to version {short}."));
-    } else if availability.pending_rebuild {
-        util::info(
-            "The files are current, but the last update did not finish building; building now.",
-        );
-    } else {
-        util::info("The files are current. Preparing DLSS and FSR support.");
     }
 
     // Rebuild with the (possibly new) manifest and patch set. Regenerate only if the patch set's

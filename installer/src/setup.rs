@@ -830,60 +830,29 @@ pub fn is_installed(dir: &Path) -> bool {
 
 #[derive(Clone, Debug)]
 pub struct UpdateInfo {
-    pub available: bool,
+    pub availability: crate::update::Availability,
     pub files: u64,
     pub bytes: u64,
     pub version: String,
 }
 
-/// Ask the installation's own installer whether GitHub has something newer (`update --check`).
+/// Check the installed files against the update source selected by this Setup.
 pub fn check_update(
     dir: &Path,
     update_repo: Option<&str>,
     update_branch: &str,
 ) -> Result<UpdateInfo, String> {
-    let ext = if cfg!(windows) { ".exe" } else { "" };
-    let cli = dir
-        .join("installer")
-        .join(format!("infamous-installer{ext}"));
-    let mut cmd = Command::new(&cli);
-    cmd.arg("update")
-        .arg("--check")
-        .arg("--root")
-        .arg(dir)
-        .current_dir(dir);
-    // The Setup may be repairing an installation made by a fork or an older package. Always use
-    // the update source embedded in this Setup instead of trusting that installation's manifest.
-    if let Some(repo) = update_repo {
-        cmd.arg("--repo").arg(repo);
-    }
-    cmd.arg("--branch").arg(update_branch);
-    let out = hide(&mut cmd)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("could not start {}: {e}", cli.display()))?;
-    let text =
-        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
-    if let Some(l) = text.lines().find(|l| l.starts_with("UPDATE-CHECK ")) {
-        let f: Vec<&str> = l.split_whitespace().collect();
-        if f.len() >= 5 {
-            return Ok(UpdateInfo {
-                available: f[1] == "available",
-                version: f[2].chars().take(10).collect(),
-                files: f[3].parse().unwrap_or(0),
-                bytes: f[4].parse().unwrap_or(0),
-            });
-        }
-    }
-    if text.contains("unknown argument 'update'") || text.contains("unknown argument") {
-        return Err("This installation is too old to update itself. Install again into the same folder with this setup once; it only redoes what changed.".into());
-    }
-    let err = text
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix("ERROR:"))
-        .next()
-        .map(|e| e.trim().to_string());
-    Err(err.unwrap_or_else(|| "could not check for updates".into()))
+    let manifest =
+        Manifest::load(&dir.join("installer/infamous.toml")).map_err(|e| e.to_string())?;
+    let remote = crate::update::Remote::new(&manifest, update_repo, Some(update_branch))
+        .map_err(|e| e.to_string())?;
+    let plan = crate::update::plan(dir, &manifest, &remote).map_err(|e| e.to_string())?;
+    Ok(UpdateInfo {
+        availability: plan.availability(dir),
+        files: (plan.fetch.len() + plan.delete.len()) as u64,
+        bytes: plan.download_bytes(),
+        version: plan.commit.chars().take(10).collect(),
+    })
 }
 
 fn run_update(
@@ -1369,6 +1338,7 @@ fn phase_for(h: &str) -> Option<(f32, String)> {
         "Done" => (0.99, "Finishing"),
         "Checking for updates" => (0.02, "Checking GitHub for a new version"),
         "Downloading the update" => (0.05, "Downloading the changed files"),
+        "Applying file changes" => (0.05, "Applying file changes"),
         "Up to date" => (0.99, "Already up to date"),
         _ if h.starts_with("Compiling") => (0.58, "Compiling the game (the long part)"),
         _ => return None,

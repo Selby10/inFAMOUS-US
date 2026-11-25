@@ -2,7 +2,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use eframe::egui::{self, Color32, RichText, Stroke};
-use infamous_installer::{setup, util};
+use infamous_installer::{setup, update::Availability, util};
 use setup::{GameInfo, GameProblem, GameSource, Installer, UpdateInfo};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -400,7 +400,16 @@ impl App {
                     ui,
                     match &st {
                         UpdState::Checking => Icon::Busy,
-                        UpdState::Done(Ok(i)) if i.available => Icon::Warn,
+                        UpdState::Done(Ok(i))
+                            if matches!(
+                                i.availability,
+                                Availability::Update
+                                    | Availability::Repair
+                                    | Availability::PendingBuild
+                            ) =>
+                        {
+                            Icon::Warn
+                        }
                         UpdState::Done(Ok(_)) => Icon::Ok,
                         UpdState::Done(Err(_)) => Icon::Bad,
                     },
@@ -419,7 +428,7 @@ impl App {
                         UpdState::Checking => {
                             ("Checking GitHub for a newer version...".to_string(), MUTED)
                         }
-                        UpdState::Done(Ok(i)) if i.available && i.files > 0 => (
+                        UpdState::Done(Ok(i)) if i.availability == Availability::Update => (
                             format!(
                                 "An update is available (version {}): {} changed file(s), {}.",
                                 i.version,
@@ -428,13 +437,10 @@ impl App {
                             ),
                             ACCENT_HI,
                         ),
-                        UpdState::Done(Ok(i)) if i.available => (
-                            "The last update did not finish; Update finishes it.".to_string(),
-                            ACCENT_HI,
-                        ),
-                        UpdState::Done(Ok(i)) => {
-                            (format!("Up to date (version {}).", i.version), OK)
-                        }
+                        UpdState::Done(Ok(i)) => match i.availability.maintenance_note() {
+                            Some(note) => (note.to_string(), MUTED),
+                            None => (format!("Up to date (version {}).", i.version), OK),
+                        },
                         UpdState::Done(Err(e)) => (e.clone(), BAD),
                     };
                     ui.label(RichText::new(text).small().color(color));
@@ -443,7 +449,11 @@ impl App {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 let can = !matches!(st, UpdState::Checking);
-                if ui.add_enabled(can, primary("Update now")).on_hover_text("Download only the files that changed on GitHub, then rebuild what they affect.").clicked() {
+                let label = match &st {
+                    UpdState::Done(Ok(i)) => i.availability.action_label().unwrap_or("Run updater"),
+                    _ => "Run updater",
+                };
+                if ui.add_enabled(can, primary(label)).clicked() {
                     do_update = true;
                 }
                 if ui.add_enabled(can, secondary("Check again")).clicked() {

@@ -1,5 +1,6 @@
 use super::*;
 use eframe::egui::{self, Color32, RichText};
+use infamous_installer::update::Availability;
 use infamous_installer::{game, lock, setup, trophy, update};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -731,7 +732,7 @@ impl Dashboard {
                 };
                 self.update = match result {
                     Ok(preview)
-                        if preview.available
+                        if preview.availability != Availability::Current
                             && *open_review
                             && self.restore.is_none()
                             && self.save_transaction.is_none()
@@ -793,25 +794,32 @@ impl Dashboard {
         if matches!(self.update, UpdateState::Disabled) {
             return;
         }
-        let available =
-            matches!(&self.update, UpdateState::Checked { result: Ok(info), .. } if info.available);
         let checking = matches!(self.update, UpdateState::Checking { .. });
-        let label = if available {
-            RichText::new("Update available").color(AMBER).strong()
-        } else if checking {
-            RichText::new("Checking for updates…")
-        } else {
-            RichText::new("Update")
+        let availability = match &self.update {
+            UpdateState::Checked {
+                result: Ok(info), ..
+            } => info.availability,
+            _ => Availability::Current,
+        };
+        let label = match availability {
+            Availability::Update => RichText::new("Update available").color(AMBER).strong(),
+            Availability::Repair => RichText::new("Repair installation"),
+            Availability::PendingBuild => RichText::new("Build incomplete").color(AMBER),
+            Availability::OptionalUpscalers => RichText::new("Upscaler setup"),
+            Availability::Current if checking => RichText::new("Checking for updates…"),
+            Availability::Current => RichText::new("Update"),
         };
         if ui
             .add_enabled(
                 !checking && self.save_transaction.is_none(),
                 egui::Button::new(label),
             )
-            .on_hover_text(if available {
+            .on_hover_text(if availability == Availability::Update {
                 "Review what's new"
             } else {
-                "Check for updates"
+                availability
+                    .maintenance_note()
+                    .unwrap_or("Check for updates")
             })
             .clicked()
         {
@@ -820,7 +828,7 @@ impl Dashboard {
                 UpdateState::Checked {
                     result: Ok(preview),
                     ..
-                } if preview.available => {
+                } if preview.availability == Availability::Update => {
                     self.notice = None;
                     self.update = UpdateState::Reviewing(preview);
                 }
@@ -834,7 +842,7 @@ impl Dashboard {
             UpdateState::Checked {
                 result: Ok(info),
                 manual: true,
-            } if !info.available => {
+            } if info.availability == Availability::Current => {
                 muted(ui, format!("Up to date ({})", short_commit(&info.commit)));
             }
             UpdateState::Checked {
@@ -861,9 +869,15 @@ impl Dashboard {
                 let mut dismiss = false;
                 let mut install = false;
                 let mut save = false;
-                window("What's New").show(ctx, |ui| {
+                let action = preview.availability.action_label().unwrap_or("Continue");
+                let title = if preview.availability == Availability::Update {
+                    "What's New"
+                } else {
+                    action
+                };
+                window(title).show(ctx, |ui| {
                     ui.set_width(480.0);
-                    muted(ui, format!("Update {}", short_commit(&preview.commit)));
+                    muted(ui, format!("Version {}", short_commit(&preview.commit)));
                     if let Some(status) = &preview.notes_status {
                         muted(ui, status);
                     }
@@ -880,10 +894,7 @@ impl Dashboard {
                     }
                     ui.separator();
                     if self.state.dirty() {
-                        muted(
-                            ui,
-                            "Save your settings changes before installing the update.",
-                        );
+                        muted(ui, "Save your settings changes before continuing.");
                         save = ui.button("Save settings").clicked();
                     }
                     if let Some((error, true)) = &self.notice {
@@ -891,10 +902,9 @@ impl Dashboard {
                     }
                     ui.horizontal(|ui| {
                         dismiss = ui.button("Later").clicked();
-                        let button = egui::Button::new(
-                            RichText::new("Install Update").strong().color(BACKGROUND),
-                        )
-                        .fill(BLUE);
+                        let button =
+                            egui::Button::new(RichText::new(action).strong().color(BACKGROUND))
+                                .fill(BLUE);
                         install = ui.add_enabled(!self.state.dirty(), button).clicked();
                     });
                 });
@@ -933,7 +943,7 @@ impl Dashboard {
             }
             UpdateState::Installing { installer, .. } => {
                 let progress = installer.progress.lock().unwrap();
-                window("Installing Update").show(ctx, |ui| {
+                window("Installer progress").show(ctx, |ui| {
                     ui.set_width(480.0);
                     ui.strong(if progress.phase.is_empty() {
                         "Starting…"
@@ -948,13 +958,13 @@ impl Dashboard {
                     if !progress.detail.is_empty() {
                         muted(ui, &progress.detail);
                     }
-                    muted(ui, "The launcher will restart when the update is complete.");
+                    muted(ui, "The launcher will restart when the installer finishes.");
                 });
             }
             UpdateState::Failed { error, log } => {
                 let mut retry = false;
                 let mut dismiss = false;
-                window("Update Could Not Finish").show(ctx, |ui| {
+                window("Installer stopped").show(ctx, |ui| {
                     ui.set_width(480.0);
                     ui.colored_label(AMBER, error);
                     ui.horizontal(|ui| {
@@ -973,7 +983,7 @@ impl Dashboard {
             }
             UpdateState::RestartFailed { launcher, error } => {
                 let mut restart = false;
-                window("Update Installed").show(ctx, |ui| {
+                window("Installation complete").show(ctx, |ui| {
                     ui.set_width(480.0);
                     ui.colored_label(AMBER, format!("Could not restart the launcher. {error}"));
                     restart = ui.button("Restart launcher").clicked();

@@ -463,9 +463,34 @@ pub struct Plan {
     pub previous_commit: Option<String>,
 }
 
-pub struct Availability {
-    pub available: bool,
-    pub pending_rebuild: bool,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Availability {
+    Update,
+    Repair,
+    PendingBuild,
+    OptionalUpscalers,
+    Current,
+}
+
+impl Availability {
+    pub fn action_label(self) -> Option<&'static str> {
+        match self {
+            Self::Update => Some("Install update"),
+            Self::Repair => Some("Repair installation"),
+            Self::PendingBuild => Some("Resume build"),
+            Self::OptionalUpscalers => Some("Set up DLSS and FSR"),
+            Self::Current => None,
+        }
+    }
+
+    pub fn maintenance_note(self) -> Option<&'static str> {
+        match self {
+            Self::Repair => Some("This version is already installed. Repair restores changed or missing release files and removes obsolete files."),
+            Self::PendingBuild => Some("The files are current. Resume the unfinished build."),
+            Self::OptionalUpscalers => Some("The files are current. You can build optional DLSS and FSR support."),
+            Self::Update | Self::Current => None,
+        }
+    }
 }
 
 impl Plan {
@@ -477,12 +502,22 @@ impl Plan {
     }
 
     pub fn availability(&self, root: &Path) -> Availability {
-        let pending_rebuild = pending_marker(root).is_file();
-        Availability {
-            available: !self.is_empty()
-                || pending_rebuild
-                || crate::upscalers::needs_provisioning(root),
-            pending_rebuild,
+        if !self.is_empty() {
+            if self
+                .previous_commit
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case(&self.commit))
+            {
+                Availability::Repair
+            } else {
+                Availability::Update
+            }
+        } else if pending_marker(root).is_file() {
+            Availability::PendingBuild
+        } else if crate::upscalers::needs_provisioning(root) {
+            Availability::OptionalUpscalers
+        } else {
+            Availability::Current
         }
     }
 }
@@ -753,7 +788,7 @@ pub fn plan(root: &Path, m: &Manifest, r: &Remote) -> Result<Plan> {
 #[derive(Clone, Debug)]
 pub struct Preview {
     pub commit: String,
-    pub available: bool,
+    pub availability: Availability,
     pub changes: Vec<String>,
     pub notes_status: Option<String>,
 }
@@ -763,16 +798,7 @@ pub fn preview(root: &Path) -> Result<Preview> {
     let remote = Remote::new(&manifest, None, None)?;
     let plan = plan(root, &manifest, &remote)?;
     let availability = plan.availability(root);
-    let (changes, notes_status) = if !availability.available {
-        (Vec::new(), None)
-    } else if plan.is_empty() {
-        let status = if availability.pending_rebuild {
-            "The files are current. The installer will finish building the previous update."
-        } else {
-            "The files are current. The installer will prepare DLSS and FSR support."
-        };
-        (Vec::new(), Some(status.into()))
-    } else {
+    let (changes, notes_status) = if availability == Availability::Update {
         match change_notes(&remote, &plan) {
             Ok(notes) => notes,
             Err(_) => (
@@ -783,10 +809,15 @@ pub fn preview(root: &Path) -> Result<Preview> {
                 ),
             ),
         }
+    } else {
+        (
+            Vec::new(),
+            availability.maintenance_note().map(str::to_owned),
+        )
     };
     Ok(Preview {
         commit: plan.commit,
-        available: availability.available,
+        availability,
         changes,
         notes_status,
     })
@@ -798,12 +829,6 @@ fn change_notes(r: &Remote, plan: &Plan) -> Result<(Vec<String>, Option<String>)
     let base = plan.previous_commit.as_deref().filter(|c| is_commit_sha(c));
     let accept = Some("application/vnd.github+json");
     if let Some(base) = base {
-        if base.eq_ignore_ascii_case(target) {
-            return Ok((
-                Vec::new(),
-                Some("No new commits. The installer will repair files or finish preparing this version.".into()),
-            ));
-        }
         let url = format!("{api}/compare/{base}...{target}");
         if let Metadata::Found(comparison) = get_metadata(r, &url, accept)? {
             if let Some(notes) = incoming_notes(&parse_json(&comparison)?, base)? {
@@ -1087,6 +1112,38 @@ pub fn touched(plan: &Plan) -> BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distinguishes_release_changes_from_repair_and_local_build_work() {
+        let root = std::env::temp_dir().join(format!("infamous-check-{}", std::process::id()));
+        let mut plan = Plan {
+            commit: "a".repeat(40),
+            previous_commit: Some("b".repeat(40)),
+            fetch: vec![],
+            delete: vec![],
+            all: vec![],
+        };
+        // A missing optional SDK is common on Windows, even for a current installation.
+        assert_eq!(
+            plan.availability(&root),
+            if cfg!(windows) {
+                Availability::OptionalUpscalers
+            } else {
+                Availability::Current
+            }
+        );
+        let marker = pending_marker(&root);
+        util::write_file(&marker, plan.commit.as_bytes()).unwrap();
+        assert_eq!(plan.availability(&root), Availability::PendingBuild);
+
+        // A deletion-only release still changes installed files. With the same commit
+        // recorded locally, the same difference instead calls for a repair.
+        plan.delete.push("obsolete-file".into());
+        assert_eq!(plan.availability(&root), Availability::Update);
+        plan.previous_commit = Some(plan.commit.clone());
+        assert_eq!(plan.availability(&root), Availability::Repair);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn json_tree() {
