@@ -13,11 +13,19 @@ const BORDER: Color32 = Color32::from_rgb(47, 58, 73);
 const MUTED: Color32 = Color32::from_rgb(159, 174, 193);
 const BLUE: Color32 = Color32::from_rgb(105, 197, 255);
 const AMBER: Color32 = Color32::from_rgb(255, 199, 107);
+const SETTINGS_GROUPS: [&str; 4] = ["Display", "Graphics", "Controls", "Game"];
+const MOVEMENT_TEST: bool = cfg!(feature = "movement-test");
+const DASHBOARD_TITLE: &str = if MOVEMENT_TEST {
+    "inFamous Movement Test (Offline)"
+} else {
+    "inFamous PC"
+};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
     Play,
     Settings,
+    Guide,
     Saves,
     Achievements,
     Support,
@@ -26,6 +34,7 @@ enum Tab {
 struct Dashboard {
     state: State,
     tab: Tab,
+    settings_target: Option<&'static str>,
     played: Arc<AtomicBool>,
     feature_check: Option<mpsc::Receiver<Features>>,
     banner: Option<egui::TextureHandle>,
@@ -201,10 +210,13 @@ impl Dashboard {
         } else {
             Tab::Play
         };
-        let installed = !state.launch.settings_only && setup::is_installed(&state.launch.root);
+        let updates_enabled = !MOVEMENT_TEST
+            && !state.launch.settings_only
+            && setup::is_installed(&state.launch.root);
         let mut dashboard = Self {
             state,
             tab,
+            settings_target: None,
             played,
             feature_check,
             banner: banner_texture(ctx),
@@ -218,13 +230,13 @@ impl Dashboard {
             save_transaction: None,
             trophy_catalog: None,
             trophy_progress: Ok(BTreeMap::new()),
-            update: if installed {
+            update: if updates_enabled {
                 UpdateState::Idle
             } else {
                 UpdateState::Disabled
             },
         };
-        if installed {
+        if updates_enabled {
             dashboard.start_update_check(ctx, false);
         }
         dashboard
@@ -365,12 +377,13 @@ impl Dashboard {
                 "Checking which graphics features this build supports...",
             );
         }
-        for (title, rows) in ["Display", "Graphics", "Controls", "Game"]
-            .into_iter()
-            .zip(self.state.groups())
-        {
+        let target = self.settings_target.take();
+        for (title, rows) in SETTINGS_GROUPS.into_iter().zip(self.state.groups()) {
             card(ui, |ui| {
-                ui.label(RichText::new(title).size(19.0).strong());
+                let heading = ui.label(RichText::new(title).size(19.0).strong());
+                if target == Some(title) {
+                    heading.scroll_to_me(Some(egui::Align::Min));
+                }
                 for row in rows {
                     self.setting(ui, row);
                 }
@@ -378,6 +391,66 @@ impl Dashboard {
         }
         if ui.button("Reset to defaults").clicked() {
             self.state.restore_defaults();
+        }
+    }
+
+    fn how_to_use(&mut self, ui: &mut egui::Ui) {
+        ui.heading("How to Use");
+        ui.label("The Play tab has quick controls for Display Mode and Frame Rate Limit. Open Display & Controls for the full list, or go straight to a group below.");
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Open settings");
+            for title in SETTINGS_GROUPS {
+                if ui.button(title).clicked() {
+                    self.select_tab(Tab::Settings);
+                    self.settings_target = Some(title);
+                }
+            }
+        });
+        card(ui, |ui| {
+            ui.label(RichText::new("Saving changes").size(19.0).strong());
+            ui.label(if self.state.launch.settings_only {
+                "Choose Save settings to write your choices to settings.ini and keep editing, or Save & close to finish. The game reads your choices the next time it starts."
+            } else {
+                "Choose Save settings to write your choices to settings.ini and keep the launcher open. Play saves pending changes before starting the game. Switching tabs keeps your edits."
+            });
+            muted(ui, "Reset to defaults on Display & Controls restores this installation's defaults. Save them to apply. During play, press F2 or choose Settings from the pause menu. The in-game menu marks changes that need a restart.");
+        });
+        if self.feature_check.is_some() {
+            muted(
+                ui,
+                "Checking which graphics features this build supports...",
+            );
+        }
+        for (title, rows) in SETTINGS_GROUPS.into_iter().zip(self.state.groups()) {
+            card(ui, |ui| {
+                ui.label(RichText::new(title).size(19.0).strong().color(BLUE));
+                for row in rows {
+                    ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(135.0);
+                            ui.strong(row.label);
+                        });
+                        ui.add(egui::Label::new(row.hint).wrap());
+                    });
+                }
+                if title == "Controls" {
+                    muted(ui, "To rebind keys, edit controls.ini next to settings.ini in the game's working folder.");
+                }
+            });
+        }
+    }
+
+    fn select_tab(&mut self, tab: Tab) {
+        if self.tab == tab {
+            return;
+        }
+        self.update.defer_review();
+        self.tab = tab;
+        if tab == Tab::Saves && self.save_transaction.is_none() {
+            self.refresh_saves();
+        }
+        if tab == Tab::Achievements {
+            self.refresh_achievements();
         }
     }
 
@@ -696,6 +769,9 @@ impl Dashboard {
     }
 
     fn start_update_check(&mut self, ctx: &egui::Context, manual: bool) {
+        if MOVEMENT_TEST || matches!(self.update, UpdateState::Disabled) {
+            return;
+        }
         let root = self.state.launch.root.clone();
         let ctx = ctx.clone();
         let (send, completion) = mpsc::channel();
@@ -1034,7 +1110,12 @@ impl Dashboard {
             }
         });
         card(ui, |ui| {
-            ui.label(RichText::new("Build & updates").size(19.0).strong());
+            let title = if MOVEMENT_TEST {
+                "Build"
+            } else {
+                "Build & updates"
+            };
+            ui.label(RichText::new(title).size(19.0).strong());
             ui.label(self.region_label());
             if ui.button("Copy build info").clicked() {
                 let root = &self.state.launch.root;
@@ -1053,16 +1134,18 @@ impl Dashboard {
                     .collect::<Vec<_>>()
                     .join("\n");
                 ui.ctx().copy_text(format!(
-                    "inFamous PC\nRegion: {}\nUpdater commit: {}\nGame executable (bytes and modified Unix time): {}\nEBOOT SHA-256: {}\n{settings}",
+                    "{DASHBOARD_TITLE}\nRegion: {}\nUpdater commit: {}\nGame executable (bytes and modified Unix time): {}\nEBOOT SHA-256: {}\n{settings}",
                     self.region_label(), commit.as_deref().unwrap_or("Unavailable"), build,
                     install.eboot.as_deref().unwrap_or("Unavailable")));
                 self.notify(Ok("Build info copied.".into()));
             }
             ui.horizontal_wrapped(|ui| {
-                ui.hyperlink_to(
-                    "GitHub releases",
-                    "https://github.com/WoofahRayetCode/inFAMOUS-US/releases",
-                );
+                if !MOVEMENT_TEST {
+                    ui.hyperlink_to(
+                        "GitHub releases",
+                        "https://github.com/WoofahRayetCode/inFAMOUS-US/releases",
+                    );
+                }
                 ui.hyperlink_to(
                     "Report an issue",
                     "https://github.com/WoofahRayetCode/inFAMOUS-US/issues/new",
@@ -1102,9 +1185,21 @@ impl eframe::App for Dashboard {
                 if self.restore.is_some() || self.update.blocks_dashboard() {
                     ui.disable();
                 }
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(DASHBOARD_TITLE).strong().color(BLUE));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let guide = egui::Button::new(
+                            RichText::new("How to Use").strong().color(BACKGROUND),
+                        )
+                        .fill(BLUE)
+                        .min_size(egui::vec2(108.0, 32.0));
+                        if ui.add(guide).clicked() {
+                            self.select_tab(Tab::Guide);
+                        }
+                        self.update_button(ui);
+                    });
+                });
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("inFamous PC").strong().color(BLUE));
-                    ui.separator();
                     for (tab, label) in [
                         (Tab::Play, "Play"),
                         (Tab::Settings, "Display & Controls"),
@@ -1112,21 +1207,10 @@ impl eframe::App for Dashboard {
                         (Tab::Achievements, "Achievements"),
                         (Tab::Support, "Support"),
                     ] {
-                        if ui.selectable_label(self.tab == tab, label).clicked() && self.tab != tab
-                        {
-                            self.update.defer_review();
-                            self.tab = tab;
-                            if tab == Tab::Saves && self.save_transaction.is_none() {
-                                self.refresh_saves();
-                            }
-                            if tab == Tab::Achievements {
-                                self.refresh_achievements();
-                            }
+                        if ui.selectable_label(self.tab == tab, label).clicked() {
+                            self.select_tab(tab);
                         }
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        self.update_button(ui);
-                    });
                 });
             });
         egui::TopBottomPanel::bottom("actions")
@@ -1200,6 +1284,7 @@ impl eframe::App for Dashboard {
                             .id_salt(match self.tab {
                                 Tab::Play => "play",
                                 Tab::Settings => "settings",
+                                Tab::Guide => "guide",
                                 Tab::Saves => "saves",
                                 Tab::Achievements => "achievements",
                                 Tab::Support => "support",
@@ -1207,6 +1292,7 @@ impl eframe::App for Dashboard {
                             .auto_shrink([false, false])
                             .show(ui, |ui| match self.tab {
                                 Tab::Play => self.home(ui),
+                                Tab::Guide => self.how_to_use(ui),
                                 Tab::Settings => {
                                     ui.add_enabled_ui(self.save_transaction.is_none(), |ui| {
                                         self.settings(ui);
@@ -1278,11 +1364,59 @@ pub(super) fn run(state: State) -> bool {
         ..Default::default()
     };
     if let Err(error) = eframe::run_native(
-        "inFamous PC",
+        DASHBOARD_TITLE,
         options,
         Box::new(move |cc| Ok(Box::new(Dashboard::new(state, result, &cc.egui_ctx)))),
     ) {
         message(&format!("Could not open the launcher: {error}"));
     }
     played.load(Ordering::Relaxed)
+}
+
+#[cfg(all(test, feature = "movement-test"))]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn installed_movement_dashboard_skips_automatic_and_manual_updates() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("infamous-offline-{}-{stamp}", std::process::id()));
+        fs::create_dir_all(root.join("installer")).unwrap();
+        fs::create_dir(root.join(".installer")).unwrap();
+        fs::write(root.join(".installer/state"), "").unwrap();
+        fs::write(
+            root.join("installer").join(format!(
+                "infamous-installer{}",
+                std::env::consts::EXE_SUFFIX
+            )),
+            "",
+        )
+        .unwrap();
+        fs::write(
+            root.join("installer/infamous.toml"),
+            include_bytes!("../../../infamous.toml"),
+        )
+        .unwrap();
+        assert!(setup::is_installed(&root));
+
+        let mut launch = Launch::from_args(&[]).unwrap();
+        launch.root = root.clone();
+        launch.cwd = root.clone();
+        launch.settings_only = false;
+        let mut state = State::new(launch);
+        state.set_features(Features::default());
+        let ctx = egui::Context::default();
+        let mut dashboard = Dashboard::new(state, Arc::new(AtomicBool::new(false)), &ctx);
+        assert!(matches!(dashboard.update, UpdateState::Disabled));
+        assert!(dashboard.notice.is_none());
+        dashboard.start_update_check(&ctx, true);
+        assert!(matches!(dashboard.update, UpdateState::Disabled));
+        fs::remove_dir_all(root).unwrap();
+    }
 }

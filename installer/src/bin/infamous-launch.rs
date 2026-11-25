@@ -1,5 +1,5 @@
-//! `inFamous.exe`: the launcher. The dashboard uses the game's settings (the
-//! same ones as the in-game Settings menu, pause menu > Settings). Play writes them to `settings.ini` and starts the game
+//! `inFamous.exe`: the launcher. The dashboard edits game settings and Animation LOD.
+//! Play saves changes to `settings.ini` and starts the game
 //! the way `installer/launch.txt` says, without a console window.
 //!
 //! `inFamous.exe --play` skips the window and starts the game straight away (the old behaviour).
@@ -190,6 +190,22 @@ impl Launch {
         self.cwd.join("settings.ini")
     }
 
+    fn game_command(&self) -> Command {
+        let mut command = Command::new(&self.exe);
+        command
+            .args(&self.args)
+            .current_dir(&self.cwd)
+            .envs(self.env.iter().cloned());
+        // Existing game builds read Animation LOD from the environment only.
+        if let Some(index) = State::read_ini(self)
+            .get(ANIMATION_LOD.key)
+            .and_then(|v| ANIMATION_LOD.find(v))
+        {
+            command.env(ANIMATION_LOD.key, ANIMATION_LOD.vals[index]);
+        }
+        command
+    }
+
     fn start(&self) -> Result<(), String> {
         if !self.exe.is_file() {
             return Err(format!(
@@ -197,11 +213,8 @@ impl Launch {
                 self.exe.display()
             ));
         }
-        let mut c = Command::new(&self.exe);
-        c.args(&self.args)
-            .current_dir(&self.cwd)
-            .envs(self.env.iter().cloned())
-            .stdin(Stdio::null());
+        let mut c = self.game_command();
+        c.stdin(Stdio::null());
         // The previous run's log is kept as <name>.prev.log (play.err.prev.log): a player who hits a problem
         // usually restarts the game before sending the log, and File::create would have emptied it.
         let open = |name: &Option<String>| -> Stdio {
@@ -249,7 +262,7 @@ const DISPLAY: &[Row] = &[
     Row {
         key: "FULLSCREEN",
         label: "Display Mode",
-        hint: "Also switchable in game with F11.",
+        hint: "Choose a window or fill the monitor. Press F11 to switch during play.",
         vals: &["0", "1"],
         names: &["Windowed", "Fullscreen"],
         fallback: 0,
@@ -257,7 +270,7 @@ const DISPLAY: &[Row] = &[
     Row {
         key: "WINDOW_SIZE",
         label: "Window Size",
-        hint: "Fits your desktop in windowed mode. Also adjustable in-game.",
+        hint: "Choose the size of the game window. Match Game Resolution follows the selected resolution. Oversized windows are scaled to fit your desktop.",
         vals: &["auto", "720p", "1080p"],
         names: &[
             "Match Game Resolution",
@@ -269,7 +282,7 @@ const DISPLAY: &[Row] = &[
     Row {
         key: "RES_SCALE",
         label: "Game Resolution",
-        hint: "Rendering quality, independent of Window Size. Use 720p for a lighter GPU load.",
+        hint: "Set the resolution of the game image independently of the window size. Higher resolutions show more detail and use more GPU power.",
         vals: &["1", "1.5", "2", "2.5", "3"],
         names: &["720p", "1080p", "1440p", "1800p", "2160p (4K)"],
         fallback: 1,
@@ -277,7 +290,7 @@ const DISPLAY: &[Row] = &[
     Row {
         key: "PRESENT_VSYNC",
         label: "V-Sync",
-        hint: "Synchronise frames with the monitor's refresh rate.",
+        hint: "Time frame presentation to the monitor's refresh to reduce screen tearing.",
         vals: &["0", "1"],
         names: &["Off", "On"],
         fallback: 0,
@@ -285,7 +298,7 @@ const DISPLAY: &[Row] = &[
     Row {
         key: "UI_FPS_CAP",
         label: "Frame Rate Limit",
-        hint: "Upper limit for the frame rate.",
+        hint: "Set the maximum frames per second. Off removes this limit.",
         vals: &["0", "30", "40", "45", "50", "60", "120", "144", "240"],
         names: &[
             "Off", "30 FPS", "40 FPS", "45 FPS", "50 FPS", "60 FPS", "120 FPS", "144 FPS",
@@ -298,7 +311,7 @@ const DISPLAY: &[Row] = &[
 const UPSCALER_BOTH: Row = Row {
     key: "UPSCALER",
     label: "Upscaling",
-    hint: "NVIDIA DLSS needs an RTX graphics card; AMD FSR works on any modern GPU.",
+    hint: "DLSS and FSR can render at a lower resolution and rebuild the image. Quality favors detail and Performance favors speed. DLAA and FSR Native AA smooth edges at full resolution. DLSS and DLAA require an NVIDIA RTX GPU.",
     vals: &[
         "off",
         "dlaa",
@@ -326,7 +339,7 @@ const UPSCALER_BOTH: Row = Row {
 const UPSCALER_DLSS: Row = Row {
     key: "UPSCALER",
     label: "Upscaling",
-    hint: "NVIDIA DLSS needs an RTX graphics card.",
+    hint: "DLSS can render at a lower resolution and rebuild the image. Quality favors detail and Performance favors speed. DLAA smooths edges at full resolution. Both require an NVIDIA RTX GPU.",
     vals: &[
         "off",
         "dlaa",
@@ -346,7 +359,7 @@ const UPSCALER_DLSS: Row = Row {
 const UPSCALER_FSR: Row = Row {
     key: "UPSCALER",
     label: "Upscaling",
-    hint: "AMD FidelityFX Super Resolution.",
+    hint: "FSR can render at a lower resolution and rebuild the image. Quality favors detail and Performance favors speed. FSR Native AA smooths edges at full resolution.",
     vals: &[
         "off",
         "fsr_native",
@@ -366,17 +379,30 @@ const UPSCALER_FSR: Row = Row {
 const FRAME_GEN: Row = Row {
     key: "FSR_FG",
     label: "Frame Generation",
-    hint: "AMD FSR frame generation.",
+    hint: "Insert an extra frame between rendered gameplay frames for smoother motion. Requires an active upscaling or native AA mode and supported hardware.",
     vals: &["0", "1"],
     names: &["Off", "On (FSR)"],
     fallback: 0,
+};
+
+const ANIMATION_LOD: Row = Row {
+    key: "ANIM_LOD",
+    label: "Animation LOD",
+    hint: "On updates eligible character poses every other frame to reduce CPU work. Off updates them every frame for smoother movement. The Low CPU preset forces this on even when you save Off.",
+    vals: &["0", "1"],
+    names: &["Off", "On"],
+    fallback: 0,
+};
+const ANIMATION_LOD_LOW_CPU: Row = Row {
+    names: &["Off (Low CPU forces On)", "On"],
+    ..ANIMATION_LOD
 };
 
 const QUALITY: &[Row] = &[
     Row {
         key: "SHADOWS",
         label: "Shadows",
-        hint: "",
+        hint: "Show shadows cast in the scene. Turn this off to remove those shadows.",
         vals: &["1", "0"],
         names: &["On", "Off"],
         fallback: 0,
@@ -384,7 +410,7 @@ const QUALITY: &[Row] = &[
     Row {
         key: "TEX_ANISO",
         label: "Texture Filter",
-        hint: "",
+        hint: "Choose how textures look at an angle, such as pavement stretching into the distance. Higher anisotropic levels keep more detail. Game Default uses the game's own filtering.",
         vals: &["-1", "0", "4", "8", "16"],
         names: &[
             "Game Default",
@@ -398,18 +424,19 @@ const QUALITY: &[Row] = &[
     Row {
         key: "TEX_MIPS",
         label: "Mipmaps",
-        hint: "",
+        hint: "Use smaller versions of textures in the distance to reduce shimmering as you move.",
         vals: &["1", "0"],
         names: &["On", "Off"],
         fallback: 0,
     },
+    ANIMATION_LOD,
 ];
 
 const CONTROLS: &[Row] = &[
     Row {
         key: "KBM_GLYPHS",
         label: "Button Prompts",
-        hint: "Automatic follows the device you used last: PlayStation, Xbox, Nintendo or Steam Deck glyphs, or keys.",
+        hint: "Choose which button icons appear on screen. Automatic follows the last device you used. A fixed choice keeps showing that device's icons.",
         vals: &["1", "0", "2", "3", "4", "5"],
         names: &["Automatic", "PlayStation", "Keyboard & Mouse", "Xbox", "Nintendo", "Steam Deck"],
         fallback: 0,
@@ -417,7 +444,7 @@ const CONTROLS: &[Row] = &[
     Row {
         key: "PAD_MOUSE_SPEED",
         label: "Mouse Speed",
-        hint: "",
+        hint: "Adjust how quickly the camera turns when you move the mouse.",
         vals: &["900", "650", "450", "325", "225"],
         names: &["1 (Slow)", "2", "3", "4", "5 (Fast)"],
         fallback: 2,
@@ -427,7 +454,7 @@ const CONTROLS: &[Row] = &[
 const GAME: &[Row] = &[Row {
     key: "PS3_LANG",
     label: "Language",
-    hint: "Dialogue, subtitles and HUD. Korean and Chinese are text only.",
+    hint: "Choose the language for dialogue, subtitles and the on-screen interface. Korean and Chinese change text only.",
     vals: &[
         "english",
         "british",
@@ -471,6 +498,7 @@ const INI_ORDER: &[&str] = &[
     "SHADOWS",
     "TEX_ANISO",
     "TEX_MIPS",
+    "ANIM_LOD",
     "UPSCALER",
     "FSR_FG",
     "PS3_LANG",
@@ -659,7 +687,24 @@ impl State {
                 gfx.push(&FRAME_GEN);
             }
         }
-        gfx.extend(QUALITY.iter());
+        for row in QUALITY {
+            if row.key == ANIMATION_LOD.key {
+                // With --settings-only the calling script starts the game with its own environment.
+                if self.launch.settings_only {
+                    continue;
+                }
+                // The game applies the Low CPU preset after loading user settings.
+                if self
+                    .launch
+                    .env_value("LOW_CPU")
+                    .is_some_and(|v| v.starts_with('1'))
+                {
+                    gfx.push(&ANIMATION_LOD_LOW_CPU);
+                    continue;
+                }
+            }
+            gfx.push(row);
+        }
         vec![
             DISPLAY.iter().collect(),
             gfx,
@@ -2077,18 +2122,21 @@ fn main() {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct SettingsFixture(PathBuf);
 
     impl SettingsFixture {
         fn new() -> Self {
+            static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             let stamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "infamous-launch-settings-{}-{stamp}",
+                "infamous-launch-settings-{}-{stamp}-{id}",
                 std::process::id()
             ));
             fs::create_dir(&path).unwrap();
@@ -2136,6 +2184,23 @@ mod tests {
     }
 
     #[test]
+    fn guide_rows_explain_the_settings_available_in_each_build() {
+        let fixture = SettingsFixture::new();
+        let mut state = fixture.state();
+        state.launch.settings_only = false;
+        for (dlss, fsr) in [(false, false), (true, false), (false, true), (true, true)] {
+            state.set_features(Features { dlss, fsr });
+            let groups = state.groups();
+            for row in groups.iter().flatten() {
+                assert!(!row.hint.trim().is_empty(), "Missing help for {}", row.key);
+            }
+            let graphics = &groups[1];
+            assert_eq!(graphics.iter().any(|r| r.key == "UPSCALER"), dlss || fsr);
+            assert_eq!(graphics.iter().any(|r| r.key == "FSR_FG"), fsr);
+        }
+    }
+
+    #[test]
     fn settings_save_preserves_custom_and_hidden_values() {
         let fixture = SettingsFixture::new();
         let mut state = fixture.state();
@@ -2169,5 +2234,69 @@ mod tests {
         assert_eq!(saved["FSR_FG"], "1");
         assert_eq!(saved["FUTURE_SETTING"], "keep");
         assert!(!state.dirty());
+    }
+
+    #[test]
+    fn animation_lod_saves_reloads_and_resets_to_the_install_default() {
+        let fixture = SettingsFixture::new();
+        let mut launch = fixture.state().launch;
+        launch.settings_only = false;
+        launch.env.push(("ANIM_LOD".into(), "1".into()));
+        launch.env.push(("LOW_CPU".into(), "1".into()));
+        let mut state = State::new(launch.clone());
+        let graphics = &state.groups()[1];
+        let lod = graphics.iter().find(|r| r.key == "ANIM_LOD").unwrap();
+        assert_eq!(lod.names[state.get(lod)], "On");
+        state.cur.insert(lod.key, 0);
+        state.save().unwrap();
+        assert_eq!(State::read_ini(&launch)["ANIM_LOD"], "0");
+
+        let mut reloaded = State::new(launch.clone());
+        assert_eq!(lod.names[reloaded.get(lod)], "Off (Low CPU forces On)");
+        reloaded.restore_defaults();
+        reloaded.save().unwrap();
+        assert_eq!(State::read_ini(&launch)["ANIM_LOD"], "1");
+
+        launch.settings_only = true;
+        let mut legacy = State::new(launch);
+        assert!(!legacy.groups()[1].iter().any(|r| r.key == "ANIM_LOD"));
+        legacy.save().unwrap();
+        assert_eq!(State::read_ini(&legacy.launch)["ANIM_LOD"], "1");
+    }
+
+    #[test]
+    fn game_process_receives_only_valid_saved_animation_lod_overrides() {
+        let fixture = SettingsFixture::new();
+        let mut launch = fixture.state().launch;
+        launch.settings_only = false;
+        launch.env.push(("LOW_CPU".into(), "1".into()));
+        // Inspect the environment in a child of the same command builder used by Play and --play.
+        #[cfg(windows)]
+        {
+            launch.exe = std::env::var_os("ComSpec").unwrap().into();
+            launch.args = ["/D", "/C", "set"].map(PathBuf::from).into();
+        }
+        #[cfg(not(windows))]
+        {
+            launch.exe = "env".into();
+        }
+        for (default, ini, expected) in [
+            ("1", "FUTURE_SETTING=keep", "1"),
+            ("1", "ANIM_LOD=invalid", "1"),
+            ("1", "ANIM_LOD=0", "0"),
+            ("0", "ANIM_LOD=1", "1"),
+        ] {
+            let mut launch = launch.clone();
+            launch.env.push(("ANIM_LOD".into(), default.into()));
+            fs::write(launch.settings_path(), ini).unwrap();
+            let output = launch.game_command().output().unwrap();
+            assert!(output.status.success());
+            let env = String::from_utf8_lossy(&output.stdout);
+            assert!(env
+                .lines()
+                .any(|line| line == format!("ANIM_LOD={expected}")));
+            assert!(env.lines().any(|line| line == "LOW_CPU=1"));
+            assert!(env.lines().any(|line| line == "UI_FPS_CAP=120"));
+        }
     }
 }

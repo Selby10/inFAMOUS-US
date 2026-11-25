@@ -182,6 +182,22 @@ incoming commit summaries when the installed revision is known. If the branch mo
 installation starts, the launcher asks you to check again so you can review the newer changes.
 **Support** opens game logs. Launching with `--play` goes straight into the game.
 
+Select **How to Use** in the top-right corner for a guide to the available settings.
+Choose **Graphics** in the guide to jump to **Animation LOD**. With LOD on, eligible
+character poses update every other frame to reduce CPU work. Off updates them every
+frame. The Low CPU preset forces LOD on. **Save settings** keeps the launcher open,
+and **Play** saves pending changes before launch.
+
+To build a separate test dashboard with update checks disabled, run this command from `installer/`.
+
+```powershell
+cargo build --release --locked --bin infamous-launch --features movement-test --target-dir target/movement-test
+```
+
+Copy `target/movement-test/release/infamous-launch.exe` into the existing game
+installation alongside its usual launcher, using the name `inFamous Test Launcher.exe`.
+Use the usual launcher to check for updates again.
+
 The launcher resolves `SAVEDATA_ROOT` with the same launch environment as the game;
 without an override it uses `<game working folder>/gamedata/dev_hdd0/home/00000001/savedata`.
 It does not infer saves from `PS3_HDD0_ROOT`, because the runtime's save subsystem

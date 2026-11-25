@@ -29,6 +29,7 @@ required-features = ["gui"]
 [features]
 default = ["gui"]
 gui = ["dep:eframe", "dep:image", "dep:rfd"]
+movement-test = ["gui"]
 
 # Dependencies are for Setup and the launcher UI. Game file tools use the standard library.
 [dependencies]
