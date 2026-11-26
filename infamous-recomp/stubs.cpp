@@ -494,53 +494,33 @@ extern "C" void inf_cell_probe(uint32_t g, int32_t idx, int ready)
  * v216 ANIMATION LOD (experiment). Every animated object has its own BatchJobList job, kicked lazily by
  * func_000285A0(obj) (obj+0x694 = kicked flag, obj+0x684 = job object) and polled by the frame update until done
  * (the main thread's biggest wait, w16). With ANIM_LOD=1 (or ABX 0x800000 for an in-run A/B) objects whose last
- * job had a SMALL parameter block (<= ANIM_LOD_MAX, default 0x10 units -- the low-detail skeletons) skip the kick
+ * job had a SMALL parameter block (<= ANIM_LOD_MAX, default 0x30 units -- the low-detail skeletons) skip the kick
  * on every other frame: func_000285A0 reports "done" without a new job, so the object keeps the pose its previous
  * job produced. Objects are split into two halves by address so the skipped work is spread over both frames.
- * func_00401570 (AddJob wrapper, r3 = obj+0x684) records each object's job size class (descriptor word 8 hi16;
- * only BatchJobList jobs of the animation module 0x61D000 are counted). [ANIMLOD] every ~10 s.
+ * The AddJob wrapper records the size at jo+4 on calls from INF_ANIM_KICK_LR. [ANIMLOD] every ~10 s.
  * ============================================================================================================ */
 extern "C" volatile int g_abx;
 extern "C" unsigned ppu_boot_frames_presented(void);
 namespace {
-struct AlEnt { uint32_t obj; uint16_t sz; uint16_t player; uint32_t chk; };   /* v219: player = Cole's object (never skipped) */
+struct AlEnt { uint32_t obj; uint16_t sz; };
 static AlEnt s_al[8192];
-static unsigned long long s_al_kick[16], s_al_skip, s_al_frames0, s_al_calls;
+static unsigned long long s_al_kick[16], s_al_skip, s_al_frames0, s_al_player_kept, s_al_unresolved;
 static unsigned s_al_last_frame = 0;
-/* v219 COLE GUARD: the LOD must never skip the player's own animation job (v217: player anim drives movement ->
- * weird gravity / speed-ups). Cole's world position is the vec4 at 0x00915430 (found with the MEMCMD memory tool:
- * x y z in cm, Z up). Each animation object is scanned (every ~2 s until found) for that position -- 3 consecutive
- * floats, or a 4x4 matrix column (stride 16) -- within 2 cm; a match marks it as the player and it is never skipped.
- * ANIM_LOD_PLAYER_POS=0 disables the guard (old behaviour). */
-static uint32_t s_al_player = 0; static uint16_t s_al_player_sz = 0; static unsigned s_al_player_off = 0;
-static uint32_t s_al_unnoted[256]; static int s_al_nun = 0; static uint32_t s_al_player_unnoted = 0;   /* v219c */
-static float al_f(uint32_t a) { uint32_t u = vm_read32(a); float f; std::memcpy(&f, &u, 4); return f; }
-static bool al_is_player(uint32_t obj, unsigned* off_out)
+static bool al_dump_enabled()
 {
-    static int on = -1; if (on < 0) { const char* e = std::getenv("ANIM_LOD_PLAYER_POS"); on = (e && *e == '0') ? 0 : 1; }
-    if (!on) return false;
-    const float px = al_f(0x00915430u), py = al_f(0x00915434u), pz = al_f(0x00915438u);
-    if (!(px == px) || (px == 0.0f && py == 0.0f)) return false;
-    /* v219b: the word after the position (0x00915444, written by guest fn 0x0049A9C0) is Cole's ENTITY pointer
-     * (found with PPU_WWATCH=00915430). His anim object is the one the entity points into, or that points into it. */
-    const uint32_t ent = vm_read32(0x00915444u);
-    if (ent >= 0x10000u && ent < 0xF0000000u) {
-        for (uint32_t o = 0; o < 0x3000u; o += 4) {
-            const uint32_t w = vm_read32(ent + o);
-            if (w >= obj && w < obj + 0x800u) { *off_out = 0x40000000u | o; return true; }
-        }
-        for (uint32_t o = 0; o < 0x800u; o += 4) {
-            const uint32_t w = vm_read32(obj + o);
-            if (w >= ent && w < ent + 0x3000u) { *off_out = 0x20000000u | o; return true; }
-        }
-    }
-    for (uint32_t o = 0; o < 0xC00u; o += 4) {
-        const float x = al_f(obj + o);
-        if (!(std::fabs(x - px) <= 2.0f)) continue;
-        if (std::fabs(al_f(obj + o + 4) - py) <= 2.0f && std::fabs(al_f(obj + o + 8) - pz) <= 2.0f) { *off_out = o; return true; }
-        if (std::fabs(al_f(obj + o + 16) - py) <= 2.0f && std::fabs(al_f(obj + o + 32) - pz) <= 2.0f) { *off_out = o | 0x80000000u; return true; }
-    }
-    return false;
+    static const bool enabled = [] {
+        const char* e = std::getenv("ANIMLOD_DUMP");
+        return e && *e == '1';
+    }();
+    return enabled;
+}
+static bool al_player_guard()
+{
+    static const bool enabled = [] {
+        const char* e = std::getenv("ANIM_LOD_PLAYER_POS");
+        return !e || *e != '0';
+    }();
+    return enabled;
 }
 static int al_max(void) { static int v = -1; if (v < 0) { const char* e = std::getenv("ANIM_LOD_MAX"); v = e ? (int)std::strtol(e, 0, 0) : 0x30; } return v; }
 static int al_env(void) { static int v = -1; if (v < 0) { const char* e = std::getenv("ANIM_LOD"); v = (e && *e == '1') ? 1 : 0;
@@ -555,6 +535,16 @@ static AlEnt* al_find(uint32_t obj, bool add)
     }
     return nullptr;
 }
+static void al_dump_unrecorded(uint32_t obj)
+{
+    static uint32_t seen[256];
+    static unsigned count = 0;
+    if (count == 256 || al_find(obj, false)) return;
+    for (unsigned i = 0; i < count; ++i) if (seen[i] == obj) return;
+    seen[count++] = obj;
+    std::fprintf(stderr, "[ANIMLOD] unrecorded anim object 0x%08X%s\n", obj,
+                 obj == infamous_player_anim_object() ? " = COLE" : "");
+}
 static void al_report(unsigned frame)
 {
     if (!s_al_frames0) { s_al_frames0 = frame; return; }
@@ -562,59 +552,36 @@ static void al_report(unsigned frame)
     const double nf = (double)(frame - s_al_frames0);
     char line[512]; int o = 0; line[0] = 0; unsigned long long tot = 0;
     for (int i = 0; i < 16; i++) { tot += s_al_kick[i]; if (s_al_kick[i]) o += std::snprintf(line + o, sizeof line - o, " 0x%02X:%.1f", i * 16, s_al_kick[i] / nf); }
-    std::fprintf(stderr, "[ANIMLOD] per frame: %.1f anim jobs kicked (size class:count%s), %.1f skipped by LOD (abx 0x%X) | player obj 0x%08X class 0x%X | unrecorded objs %d (Cole 0x%08X)\n",
-                 tot / nf, line, s_al_skip / nf, (unsigned)g_abx, s_al_player, (unsigned)s_al_player_sz, s_al_nun, s_al_player_unnoted);
-    { static int dump = -1; if (dump < 0) { const char* e = std::getenv("ANIMLOD_DUMP"); dump = (e && *e == '1') ? 1 : 0; }
-      if (dump && !s_al_player_unnoted) for (int i = 0; i < s_al_nun; i++) { unsigned off = 0;   /* v219c re-check */
-          if (al_is_player(s_al_unnoted[i], &off)) { s_al_player_unnoted = s_al_unnoted[i];
-              std::fprintf(stderr, "[ANIMLOD] v219c COLE = unrecorded anim object 0x%08X (match 0x%X) -> never skipped by the size LOD\n", s_al_unnoted[i], off); break; } }
-      if (dump) {   /* v219: every anim object (address:size class) -- to locate Cole's (compare with MEMCMD find3) */
-          char b[2048]; int k = 0, n = 0; b[0] = 0;
-          for (int i = 0; i < 8192 && k < (int)sizeof b - 24; i++) if (s_al[i].obj) { n++;
-              k += std::snprintf(b + k, sizeof b - k, " %08X:%X%s", s_al[i].obj, s_al[i].sz, s_al[i].player ? "P" : ""); }
-          std::fprintf(stderr, "[ANIMLOD] objs (%d):%s\n", n, b); } }
+    const uint32_t player = infamous_player_anim_object();
+    const AlEnt* entry = player ? al_find(player, false) : nullptr;
+    std::fprintf(stderr, "[ANIMLOD] per frame: %.1f anim jobs kicked (size class:count%s), %.1f skipped by LOD (abx 0x%X) | player obj 0x%08X class 0x%X | guard %s: %llu player candidates kept, %llu kept with unresolved player\n",
+                 tot / nf, line, s_al_skip / nf, (unsigned)g_abx, player, entry ? (unsigned)entry->sz : 0u,
+                 al_player_guard() ? "on" : "off", s_al_player_kept, s_al_unresolved);
+    if (al_dump_enabled()) {
+        char b[2048]; int k = 0, n = 0; b[0] = 0;
+        for (int i = 0; i < 8192 && k < (int)sizeof b - 24; i++) if (s_al[i].obj) { n++;
+            k += std::snprintf(b + k, sizeof b - k, " %08X:%X%s", s_al[i].obj, s_al[i].sz, s_al[i].obj == player ? "P" : ""); }
+        std::fprintf(stderr, "[ANIMLOD] objs (%d):%s\n", n, b);
+    }
+    s_al_player_kept = s_al_unresolved = 0;
     for (int i = 0; i < 16; i++) s_al_kick[i] = 0;
     s_al_skip = 0; s_al_frames0 = frame;
 }
 }
 extern "C" void infamous_anim_lod_note(ppu_context* ctx)
 {
-    /* The shipping launcher disables animation LOD. Keep its experimental
-     * bookkeeping out of the always-hot AddJob path in that configuration:
-     * besides hashing every animation job, it periodically scans several KB
-     * of guest memory per object to identify the player. The live ABX bit can
-     * still enable the experiment without restarting. */
     if (!al_enabled()) return;
     const uint32_t jo = (uint32_t)ctx->gpr[3];
     if (jo < 0x10000u || jo >= 0xF0000000u) return;
-    { static int n = 12; if (n < 12) { n++;   /* v216b (off since v218): what the AddJob wrapper really gets (first calls) */
-        const uint32_t a0 = vm_read32(jo), a1 = vm_read32(jo + 4);
-        std::fprintf(stderr, "[ANIMLOD] note r3=0x%08X [0]=0x%08X [4]=0x%08X lr=0x%08X |", jo, a0, a1, (uint32_t)ctx->lr);
-        for (int i = 0; i < 12 && a0 >= 0x10000u && a0 < 0xF0000000u; i++) std::fprintf(stderr, " %08X", vm_read32(a0 + 4u * i));
-        std::fprintf(stderr, " |");
-        for (int i = 0; i < 12 && a1 >= 0x10000u && a1 < 0xF0000000u; i++) std::fprintf(stderr, " %08X", vm_read32(a1 + 4u * i));
-        std::fprintf(stderr, "\n"); } }
     /* v218: [0] = the job's parameter block (per-frame 0x48CFxxxx command stream), [4] = its size in 16-byte units
      * (perf217: 0x30 / 0x40 ...). Only calls from the animation kick func_000282C8 (lr 0x28554) count. */
     if ((uint32_t)ctx->lr != INF_ANIM_KICK_LR) return;
     const uint32_t szc = vm_read32(jo + 4);
     if (!szc || szc > 0x1000u) return;
-    if (AlEnt* e = al_find(jo - 0x684u, true)) {
-        e->sz = (uint16_t)szc;
-        if (e->player) s_al_player_sz = (uint16_t)szc;
-        else {
-            const unsigned fr = ppu_boot_frames_presented();
-            if (!e->chk || fr - e->chk >= 120) { e->chk = fr ? fr : 1; unsigned off = 0;
-                if (al_is_player(e->obj, &off)) { e->player = 1; s_al_player = e->obj; s_al_player_sz = (uint16_t)szc; s_al_player_off = off;
-                    std::fprintf(stderr, "[ANIMLOD] v219 Cole's animation object = 0x%08X (%s +0x%X, entity 0x%08X), job size class 0x%X -> never skipped\n",
-                                 e->obj, (off & 0x40000000u) ? "entity points into it from" : (off & 0x20000000u) ? "it points into the entity from" :
-                                 (off & 0x80000000u) ? "position matrix column at" : "position at", off & 0xFFFFu, vm_read32(0x00915444u), szc); } }
-        }
-    }
+    if (AlEnt* e = al_find(jo - 0x684u, true)) e->sz = (uint16_t)szc;
     s_al_kick[szc >= 0x100u ? 15 : (szc >> 4) & 15]++;
 }
 /* trainer.cpp: the Player Model stand-in's animation job is replaced by Cole's bones (1 = skip, report done) */
-extern "C" int infamous_trainer_anim_hook(uint32_t anim_obj);
 extern "C" int infamous_anim_lod_skip(ppu_context* ctx)
 {
     if (infamous_trainer_anim_hook((uint32_t)ctx->gpr[3])) return 1;
@@ -624,20 +591,19 @@ extern "C" int infamous_anim_lod_skip(ppu_context* ctx)
     const uint32_t obj = (uint32_t)ctx->gpr[3];
     if (obj < 0x10000u || obj >= 0xF0000000u) return 0;
     if (vm_read8(obj + 0x694)) return 0;                  /* a job is in flight: let the game poll it */
-    const AlEnt* e = al_find(obj, false);
-    if (!e) {   /* v219c: objects the skip hook sees that the size table never recorded (other kick paths) -- never
-                 * skipped in MAX mode; logged once each and checked for Cole (ANIMLOD_DUMP=1) */
-        bool known = false; for (int i = 0; i < s_al_nun; i++) if (s_al_unnoted[i] == obj) { known = true; break; }
-        if (!known && s_al_nun < 256) { s_al_unnoted[s_al_nun++] = obj;
-            static int dump = -1; if (dump < 0) { const char* d = std::getenv("ANIMLOD_DUMP"); dump = (d && *d == '1') ? 1 : 0; }
-            if (dump) { unsigned off = 0; const bool pl = al_is_player(obj, &off); if (pl) s_al_player_unnoted = obj;
-                std::fprintf(stderr, "[ANIMLOD] v219c unrecorded anim object 0x%08X (never skipped unless ANIM_LOD_ALL)%s\n", obj,
-                             pl ? " = COLE (entity/position match)" : ""); } }
-    }
-    static int s_all = -1; if (s_all < 0) { const char* v = std::getenv("ANIM_LOD_ALL"); s_all = (v && *v == '1') ? 1 : 0; }
-    if (e && e->player) return 0;                          /* v219: never Cole */
-    if (!s_all && (!e || !e->sz || e->sz > al_max())) return 0;   /* unknown or a detailed skeleton: always update */
+    if (al_dump_enabled()) al_dump_unrecorded(obj);
     if (((frame + (obj >> 9)) & 1u) != 0) return 0;      /* this object's update frame */
+    static int s_all = -1; if (s_all < 0) { const char* v = std::getenv("ANIM_LOD_ALL"); s_all = (v && *v == '1') ? 1 : 0; }
+    if (!s_all) {
+        const AlEnt* e = al_find(obj, false);
+        if (!e || !e->sz || e->sz > al_max()) return 0;
+    }
+    /* Cole's animation drives movement. Resolve the current owner only when the LOD would skip a job. */
+    if (al_player_guard()) {
+        const uint32_t player = infamous_player_anim_object();
+        if (!player) { ++s_al_unresolved; return 0; }
+        if (obj == player) { ++s_al_player_kept; return 0; }
+    }
     s_al_skip++;
     return 1;
 }

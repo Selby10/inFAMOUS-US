@@ -86,14 +86,18 @@ long long now_ms()
 
 /* Cole's character object or 0 (majority vote over the player pointers listed at the top).  Current health may be
  * above max here: the game can lower max under a value the Max Health option raised, and we still need Cole then. */
-uint32_t player_object()
+uint32_t player_object(bool require_unique_cole = false)
 {
     if (!vm_base) return 0;
     uint32_t v[5]; int n = 0;
     for (uint32_t s : kPlayerSlots) v[n++] = vm_read32(s);
     uint32_t best = 0; int best_votes = 0;
     for (int i = 0; i < n; ++i) {
-        if (!heap_ptr(v[i])) continue;
+        if (!heap_ptr(v[i]) || v[i] == best) continue;
+        if (require_unique_cole) {
+            if (vm_read32(v[i]) != kClassCole) continue;
+            if (best) return 0;  /* Different Cole actors still referenced during a transition. */
+        }
         int votes = 0;
         for (int j = 0; j < n; ++j) votes += (v[j] == v[i]);
         if (votes > best_votes) { best_votes = votes; best = v[i]; }
@@ -396,7 +400,7 @@ std::atomic<int>      g_model_req{0};       /* row value: 0 = Cole, 1..kCharsN =
 std::atomic<int>      g_model_status{0};    /* 0 Cole, 3 loading, 1 preparing, 2 live, -1 nobody nearby, -2 failed */
 std::atomic<uint32_t> g_model_show{0};      /* model id shown in the row */
 int      s_model_k = 0;
-uint32_t s_si = 0, s_si_anim = 0, s_cole = 0;
+uint32_t s_si = 0, s_cole = 0;
 bool     s_si_coll_off = false, s_rt_ok = false, s_si_spawned = false;
 BindCap  s_cap_cole, s_cap_ped;
 Retarget s_rt;
@@ -461,7 +465,7 @@ void standin_release(const char* why)
     g_frozen_actor.store(0);
     if (s_si && s_si_team_set && actor_ok(s_si)) vm_write32(s_si + kOffTeam, s_si_team);
     s_si_team_set = false;
-    s_si = s_si_anim = 0; s_si_coll_off = false; s_rt_ok = false; s_si_spawned = false; s_cap_ped.obj = 0; s_cap_ped.state = 0; s_cap_ped.tries = 0;
+    s_si = 0; s_si_coll_off = false; s_rt_ok = false; s_si_spawned = false; s_cap_ped.obj = 0; s_cap_ped.state = 0; s_cap_ped.tries = 0;
 }
 
 /* Put the ped on Cole's feet with Cole's heading. */
@@ -746,7 +750,6 @@ void model_tick(uint32_t cole)
         /* user 2026-10-22: the shared-only head fix (session 6d) suits Zeke but stretched Kessler/Trish heads -> Zeke only */
         if (!build_retarget(s_cap_ped, s_cap_cole, s_rt, s_char == 0, s_char != 0 && s_char != 2)) {   /* head lock: not Zeke / Kessler */ model_fail("retarget failed"); return; }
         s_rt_ok = true;
-        s_si_anim = vm_read32(s_si + kOffAnim);
         guest_call1(func_00200568, kCollOff, s_si + kOffCollList); s_si_coll_off = true;
         g_model_status.store(2);
         std::fprintf(stderr, "[TRAINER] player model LIVE: 0x%08X (%d bones) wears Cole (%d): %d shared bones (%d hand bones on the wrist, %d on the head), "
@@ -1242,11 +1245,23 @@ bool freeze_hooks_install()
 }
 } // namespace
 
+/* Read at the point of use. Guest addresses may be recycled even within a presented frame. */
+extern "C" uint32_t infamous_player_anim_object(void)
+{
+    const uint32_t cole = player_object(true);
+    if (!cole) return 0;
+    const uint32_t anim = vm_read32(cole + kOffAnim);
+    return heap_ptr(anim) ? anim : 0;
+}
+
 /* stubs.cpp infamous_anim_lod_skip, at the entry of func_000285A0(anim) on the main thread: the stand-in's own animation
  * job is not kicked ("done"); its bones are Cole's, written here and in the tick.  1 = skip. */
 extern "C" int infamous_trainer_anim_hook(uint32_t anim)
 {
-    if (!anim || anim != s_si_anim || !standin_live()) return 0;
+    if (!standin_live() || !anim || vm_read32(s_si + kOffAnim) != anim) return 0;
+    if (!s_cole || player_object(true) != s_cole) return 0;
+    const uint32_t cole_anim = vm_read32(s_cole + kOffAnim);
+    if (!heap_ptr(cole_anim) || anim == cole_anim) return 0;
     standin_write_bones();
     return 1;
 }

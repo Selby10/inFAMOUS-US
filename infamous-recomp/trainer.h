@@ -1,4 +1,5 @@
 #pragma once
+#include <stdint.h>
 /* inFamous in-game trainer (F10).  Always built; TRAINER=0 in the environment turns it off.
  *
  * Content and cheats live here (trainer.cpp); the page itself is drawn by the port overlay
@@ -16,6 +17,9 @@ extern "C" {
 #endif
 
 void infamous_trainer_install(void);   /* stubs.cpp ps3_load_prx_modules() */
+
+uint32_t infamous_player_anim_object(void);  /* live player animation object or zero, also available with TRAINER=0 */
+int infamous_trainer_anim_hook(uint32_t anim);
 
 #ifdef __cplusplus
 }
