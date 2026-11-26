@@ -268,6 +268,44 @@ static void rect(float x0, float y0, float x1, float y1, const float c0[4], cons
 }
 static void rgba(float o[4], float r, float g, float b, float a) { o[0] = r; o[1] = g; o[2] = b; o[3] = a; }
 
+/* F2 setting arrows are geometry, not font glyphs: the extracted game font may
+ * not contain '<', so text_draw() can silently replace that character with a space. */
+static void uiov_solid_triangle(float x0, float y0, float x1, float y1, float x2, float y2,
+                                const float col[4])
+{
+    if (s_nv + 3 > UIOV_MAX_VERTS) return;
+    const float u = (s_wx + 0.5f) / s_aw, v = (s_wy + 0.5f) / s_ah;
+    UVert* o = s_v + s_nv;
+    o[0] = (UVert){ x0, y0, u, v, col[0], col[1], col[2], col[3] };
+    o[1] = (UVert){ x1, y1, u, v, col[0], col[1], col[2], col[3] };
+    o[2] = (UVert){ x2, y2, u, v, col[0], col[1], col[2], col[3] };
+    s_nv += 3;
+}
+
+static void uiov_solid_line(float x0, float y0, float x1, float y1, float thickness,
+                            const float col[4])
+{
+    const float dx = x1 - x0, dy = y1 - y0;
+    const float len = sqrtf(dx * dx + dy * dy);
+    if (len < 0.001f) return;
+    const float nx = -dy * thickness * 0.5f / len;
+    const float ny =  dx * thickness * 0.5f / len;
+    uiov_solid_triangle(x0 + nx, y0 + ny, x1 + nx, y1 + ny, x1 - nx, y1 - ny, col);
+    uiov_solid_triangle(x0 + nx, y0 + ny, x1 - nx, y1 - ny, x0 - nx, y0 - ny, col);
+}
+
+static void uiov_menu_chevron(float cx, float cy, float height, int points_left, const float col[4])
+{
+    const float hw = height * 0.30f, half = height * 0.5f, thick = height * 0.105f;
+    if (points_left) {
+        uiov_solid_line(cx + hw, cy - half, cx - hw, cy, thick, col);
+        uiov_solid_line(cx - hw, cy, cx + hw, cy + half, thick, col);
+    } else {
+        uiov_solid_line(cx - hw, cy - half, cx + hw, cy, thick, col);
+        uiov_solid_line(cx + hw, cy, cx - hw, cy + half, thick, col);
+    }
+}
+
 static unsigned utf8_next(const unsigned char** p)
 {
     const unsigned char* s = *p; unsigned c = *s++;
@@ -532,12 +570,14 @@ int (*volatile g_uiov_paused_fn)(void) = 0;
 volatile unsigned long long g_pause_menu_built_ms = 0;   /* infamous-recomp/stubs.cpp: last time the pause menu was built */
 /* v195: set by the native pause-menu entries (stubs.cpp, script natives on the PPU thread): 1 = Settings, 2 = Quit Game */
 volatile int g_uiov_request = 0;
+static float s_perf_overlay_scale = 1.0f; /* F1 overlay size: 0.50-1.00, live from F2 settings */
 /* v243K: val/name 8 -> 12 (Language has 12 choices) */
 typedef struct { const char* key; const char* label; int restart; int n; const char* val[12]; const char* name[12]; int cur, saved; } MItem;
 static MItem s_mi[] = {
     { "FULLSCREEN",      "Display Mode",       0, 2, { "0", "1" }, { "Windowed", "Fullscreen" } },
     { "PRESENT_VSYNC",   "VSync",              0, 2, { "0", "1" }, { "Off", "On" } },
     { "UI_FPS_CAP",      "Frame Rate Limit",   0, 9, { "0", "30", "40", "45", "50", "60", "120", "144", "240" }, { "Off", "30 FPS", "40 FPS", "45 FPS", "50 FPS", "60 FPS", "120 FPS", "144 FPS", "240 FPS" } },   /* v209b: Auto removed */
+    { "PERF_OVERLAY_SCALE", "Performance Overlay Size", 0, 11, { "50", "55", "60", "65", "70", "75", "80", "85", "90", "95", "100" }, { "50%", "55%", "60%", "65%", "70%", "75%", "80%", "85%", "90%", "95%", "100%" } },
     { "KBM_GLYPHS",      "Button Prompts",     0, 6, { "1", "0", "2", "3", "4", "5" }, { "Automatic", "PlayStation", "Keyboard & Mouse", "Xbox", "Nintendo", "Steam Deck" } },
     { "PAD_MOUSE_SPEED", "Mouse Speed",        0, 5, { "900", "650", "450", "325", "225" }, { "1 (Slow)", "2", "3", "4", "5 (Fast)" } },
     { "WINDOW_SIZE",     "Window Size",        0, 3, { "auto", "720p", "1080p" }, { "Match Game Resolution", "720p (1280 x 720)", "1080p (1920 x 1080)" } },
@@ -594,6 +634,7 @@ static void menu_apply(int i, HWND hwnd, int initializing)
     else if (!strcmp(m->key, "UI_FPS_CAP")) g_ui_fps_cap = atoi(v);
     else if (!strcmp(m->key, "KBM_GLYPHS")) g_ui_kbm_glyphs = atoi(v);
     else if (!strcmp(m->key, "PAD_MOUSE_SPEED")) g_ui_mouse_speed = atoi(v);
+    else if (!strcmp(m->key, "PERF_OVERLAY_SCALE")) s_perf_overlay_scale = (float)atoi(v) * 0.01f;
     else if (!strcmp(m->key, "WINDOW_SIZE") && hwnd && !initializing) {
         /* Startup already sized the window. Subsequent changes belong to its owner thread. */
         if (!PostMessageA(hwnd, RSX_WM_WINDOW_SIZE, rsx_window_preset_from_setting(v), 0))
@@ -658,6 +699,7 @@ static void menu_init(HWND hwnd)
             if (!strcmp(m->key, "PAD_MOUSE_SPEED")) k = 2;
             else if (!strcmp(m->key, "RES_SCALE")) k = 1;
             else if (!strcmp(m->key, "UI_FPS_CAP")) k = 5;
+            else if (!strcmp(m->key, "PERF_OVERLAY_SCALE")) k = m->n - 1; /* default 100% */
             else k = 0;
         }
         m->cur = m->saved = k;
@@ -689,7 +731,12 @@ static void menu_close(void)
 static void menu_change(int i, int d, HWND hwnd)
 {
     MItem* m = &s_mi[i];
-    if (m->cur < 0) m->cur = d > 0 ? 0 : m->n - 1;
+    if (!strcmp(m->key, "PERF_OVERLAY_SCALE")) {
+        /* This setting has hard 50%-100% bounds; Left reduces, Right increases. */
+        if (m->cur < 0) m->cur = m->n - 1;
+        else if (d < 0 && m->cur > 0) m->cur--;
+        else if (d > 0 && m->cur < m->n - 1) m->cur++;
+    } else if (m->cur < 0) m->cur = d > 0 ? 0 : m->n - 1;
     else m->cur = (m->cur + d + m->n) % m->n;
     menu_apply(i, hwnd, 0);
     if (m->restart) s_restart_note = 1;
@@ -905,8 +952,27 @@ static void build_menu(void)
             if (m->restart) { const char* rs = "(restart)"; float lw = text_width(m->label, (int)strlen(m->label), lsz);
                               float g2[4]; rgba(g2, 0.45f, 0.45f, 0.45f, 1); text_draw(rs, 9, x0 + lw + 12.0f, y + rh * 0.15f, lsz * 0.7f, g2); }   /* v243K: scales with the row */
             const char* value = m->cur >= 0 ? m->name[m->cur] : "Custom";
-            char v[96]; snprintf(v, sizeof v, "%s   %s   %s", on ? "<" : " ", value, on ? ">" : " ");
-            text_draw(v, (int)strlen(v), x1 - text_width(v, (int)strlen(v), lsz), y, lsz, on ? wt : gr);
+            const int value_len = (int)strlen(value);
+            const float value_w = text_width(value, value_len, lsz);
+            int can_left = on, can_right = on;
+            if (on && !strcmp(m->key, "PERF_OVERLAY_SCALE") && m->cur >= 0) {
+                /* This scale is bounded: 100% only moves left; 50% only moves right. */
+                can_left = m->cur > 0;
+                can_right = m->cur < m->n - 1;
+            }
+            const float arrow_h = lsz * 0.48f;
+            const float arrow_w = arrow_h * 0.60f;
+            const float gap = lsz * 0.34f;
+            const float group_w = value_w + (can_left ? arrow_w + gap : 0.0f) +
+                                              (can_right ? arrow_w + gap : 0.0f);
+            const float group_x = x1 - group_w;
+            const float value_x = group_x + (can_left ? arrow_w + gap : 0.0f);
+            if (can_left)
+                uiov_menu_chevron(group_x + arrow_w * 0.5f, y + rh * 0.5f, arrow_h, 1, on ? wt : gr);
+            text_draw(value, value_len, value_x, y, lsz, on ? wt : gr);
+            if (can_right)
+                uiov_menu_chevron(value_x + value_w + gap + arrow_w * 0.5f,
+                                  y + rh * 0.5f, arrow_h, 0, on ? wt : gr);
         } else {
             const char* t = r == MR_RESUME ? "Back" : "Quit Game";
             text_draw(t, (int)strlen(t), x0, y, lsz, col);
@@ -1193,7 +1259,8 @@ static void fps_tick(void)
 static void fps_build(void)
 {
     const int mode = g_uiov_show_fps;
-    const float scale = 1.0f;
+    const float scale = (s_perf_overlay_scale >= 0.50f && s_perf_overlay_scale <= 1.00f)
+        ? s_perf_overlay_scale : 1.00f;
     char ln[4][96];
     float lsz[4], lh[4], lc[4][4];
     int nl = 0, i, graph;
