@@ -34,6 +34,7 @@
 #include <sys/mman.h>
 #endif
 #include "infamous_region.h"
+#include "game_hdd.h"
 #include "ppu_recomp.h"
 
 /* The Win32 names -- Sleep, GetTickCount64, CreateThread, InterlockedIncrement,
@@ -71,6 +72,7 @@ void     ppu_hle_init(void);                  /* firmware import NID -> HLE hand
 void     ppu_sysprx_register(void);           /* boot-critical CRT (sys_initialize_tls, ...) */
 void     ppu_fs_register(void);               /* cellFs over the real game directory */
 void     cellGame_init_from_paramsfo(const char* path); /* title-specific HDD paths */
+const char* cellGame_get_title_id(void);
 void     lv2_init_syscalls(void);             /* the lv2 syscall table */
 int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
 
@@ -1047,6 +1049,8 @@ int main(int argc, char** argv)
             snprintf(sfo, sizeof sfo, layouts[0], ppu_vfs_root);
         cellGame_init_from_paramsfo(sfo);
     }
+    if (!configure_game_hdd(ppu_vfs_root, cellGame_get_title_id()))
+        return 1;
 
     ppu_recomp_register();   /* lifted function table -> address map */
     ps3_load_prx_modules();  /* this game's lifted system PRX, if it has any */

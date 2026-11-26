@@ -4,6 +4,7 @@
 
 #include "sys_fs.h"
 #include "../../libs/filesystem/edat.h"
+#include "../../libs/filesystem/fs_host_open.h"
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdio.h>
@@ -30,6 +31,9 @@
 sys_fs_fd_info  g_sys_fs_fds[SYS_FS_FD_MAX];
 sys_fs_dir_info g_sys_fs_dirs[SYS_FS_DIR_MAX];
 char            g_sys_fs_root[512] = ".";
+/* Set at boot only when the port chose the HDD mount. Explicit HDD mounts
+ * remain self-contained. Old raw reads may also use a flattened disc tree. */
+int             sys_fs_default_hdd0 = 0;
 extern const char* ppu_vfs_root;
 
 static void write_be32(uint32_t addr, uint32_t val)
@@ -123,7 +127,26 @@ void ps3_vfs_ps3game_fallback(char* path, size_t cap)
     snprintf(path, cap, "%s", alt);
 }
 
-void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
+/* PPU and library calls used different locations before the game configured
+ * its HDD. Consult only that handler's previous tree on a read miss. In
+ * particular a disc PSARC must not look like an already-installed HDD copy. */
+void ps3_vfs_hdd0_legacy_read(const char* guest, char* mounted, size_t cap,
+                              const char* previous_root)
+{
+    if (!sys_fs_default_hdd0 || strncmp(guest, "/dev_hdd0/", 10) != 0)
+        return;
+    struct stat st;
+    if (stat(mounted, &st) == 0 || errno != ENOENT)
+        return;
+    char previous[1100];
+    int len = snprintf(previous, sizeof previous, "%s/%s", previous_root, guest + 10);
+    if (len < 0 || (size_t)len >= sizeof previous) return;
+    ps3_vfs_ps3game_fallback(previous, sizeof previous);
+    if (stat(previous, &st) == 0)
+        snprintf(mounted, cap, "%s", previous);
+}
+
+static void translate_legacy_path(const char* ps3_path, char* host_path, int host_path_size)
 {
     /* Share the boot harness's VFS root unless sys_fs has an explicit override. */
     const char* root = g_sys_fs_root;
@@ -134,19 +157,6 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
             g_sys_fs_root[sizeof(g_sys_fs_root) - 1] = '\0';
         } else if (ppu_vfs_root && *ppu_vfs_root) {
             root = ppu_vfs_root;
-        }
-    }
-
-    /* /dev_hdd0 overlays the installed game-update dir (patchN.farc live there
-     * for a disc title patched to e.g. v1.30) -- mirror ppu_fs.cpp host_path.
-     * PS3_HDD0_ROOT = host dir that /dev_hdd0 maps into (contains game/<title>/). */
-    {
-        static const char* hdd0_root = NULL; static int hdd0_init = 0;
-        if (!hdd0_init) { hdd0_root = getenv("PS3_HDD0_ROOT"); hdd0_init = 1; }
-        if (hdd0_root && strncmp(ps3_path, "/dev_hdd0/", 10) == 0) {
-            snprintf(host_path, (size_t)host_path_size, "%s/%s", hdd0_root, ps3_path + 10);
-            fs_normalize_sep(host_path);
-            return;
         }
     }
 
@@ -268,6 +278,34 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
     ps3_vfs_ps3game_fallback(host_path, (size_t)host_path_size);
 }
 
+static void translate_path(const char* guest, char* host, int cap, int read_only)
+{
+    if (strncmp(guest, "/dev_hdd0/", 10) == 0) {
+        const char* hdd = getenv("PS3_HDD0_ROOT");
+        const char* usrdir = sys_fs_default_hdd0 ? getenv("PS3_USRDIR_BASE") : NULL;
+        if (hdd && *hdd && !(usrdir && *usrdir && strstr(guest, "USRDIR/"))) {
+            snprintf(host, (size_t)cap, "%s/%s", hdd, guest + 10);
+            fs_normalize_sep(host);
+            if (sys_fs_default_hdd0 && read_only) {
+                struct stat st;
+                if (stat(host, &st) != 0 && errno == ENOENT) {
+                    char legacy[1024];
+                    translate_legacy_path(guest, legacy, sizeof legacy);
+                    if (stat(legacy, &st) == 0)
+                        snprintf(host, (size_t)cap, "%s", legacy);
+                }
+            }
+            return;
+        }
+    }
+    translate_legacy_path(guest, host, cap);
+}
+
+void sys_fs_translate_path(const char* guest, char* host, int cap)
+{
+    translate_path(guest, host, cap, 1);
+}
+
 /* ---------------------------------------------------------------------------
  * sys_fs_open
  *
@@ -289,7 +327,8 @@ int64_t sys_fs_open(ppu_context* ctx)
 
     const char* ps3_path = (const char*)vm_to_host(path_addr);
     char host_path[1024];
-    sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    const int read_only = fs_read_only(flags);
+    translate_path(ps3_path, host_path, sizeof(host_path), read_only);
 
     { extern char* getenv(const char*); if (getenv("FLOW_TITLEOPEN") && ps3_path && strstr(ps3_path, "Titles")) {
         size_t _l = strlen(ps3_path);
@@ -318,9 +357,11 @@ int64_t sys_fs_open(ppu_context* ctx)
      * sees its ciphertext -- sceNpDrmIsAvailable primes the kernel and cellFsOpen
      * returns plaintext. Decrypt once into a cache file and open that instead, so
      * every read/seek/stat path below stays unchanged. (libs/filesystem/edat.c) */
-    { char dec_path[1200];
-      const char* use = edat_resolve(host_path, dec_path, sizeof dec_path);
-      if (use != host_path) snprintf(host_path, sizeof host_path, "%s", use); }
+    if (read_only) {
+        char dec_path[1200];
+        const char* use = edat_resolve(host_path, dec_path, sizeof dec_path);
+        if (use != host_path) snprintf(host_path, sizeof host_path, "%s", use);
+    }
 
     /* Find free fd slot */
     int slot = -1;
@@ -330,105 +371,34 @@ int64_t sys_fs_open(ppu_context* ctx)
     if (slot < 0)
         return (int64_t)(int32_t)CELL_ENOMEM;
 
-    /* Determine fopen mode from PS3 flags */
-    const char* mode;
-    int access = flags & CELL_FS_O_ACCMODE;
+    FILE* fp = fs_host_open(host_path, flags);
 
-    if (flags & CELL_FS_O_CREAT) {
-        if (flags & CELL_FS_O_TRUNC) {
-            if (access == CELL_FS_O_RDWR)
-                mode = "w+b";
-            else
-                mode = "wb";
-        } else if (flags & CELL_FS_O_APPEND) {
-            if (access == CELL_FS_O_RDWR)
-                mode = "a+b";
-            else
-                mode = "ab";
-        } else {
-            /* Create but don't truncate: open for read/write, create if not exist */
-            if (access == CELL_FS_O_RDWR)
-                mode = "r+b";
-            else if (access == CELL_FS_O_WRONLY)
-                mode = "r+b";
-            else
-                mode = "rb";
-        }
-    } else if (flags & CELL_FS_O_TRUNC) {
-        if (access == CELL_FS_O_RDWR)
-            mode = "w+b";
-        else
-            mode = "wb";
-    } else if (flags & CELL_FS_O_APPEND) {
-        if (access == CELL_FS_O_RDWR)
-            mode = "a+b";
-        else
-            mode = "ab";
-    } else {
-        if (access == CELL_FS_O_RDWR)
-            mode = "r+b";
-        else if (access == CELL_FS_O_WRONLY)
-            mode = "r+b";
-        else
-            mode = "rb";
-    }
-
-    FILE* fp = fopen(host_path, mode);
-
-    /* Transient open failures: on Windows an existing, correctly-pathed file can
-     * intermittently fail to open (AV/indexer holding a share lock, or momentary
-     * handle pressure) -- which surfaced as a NONDETERMINISTIC "Cg shader file
-     * could not be read" abort. Retry a few times with a brief backoff for a
-     * read-only open of a file that exists; deterministic and cheap. */
-    /* ...but ONLY when the failure could plausibly be transient. ENOENT is not:
-     * the path does not exist and never will within this open. Retrying it cost
-     * 3000 x Sleep(1) = tens of seconds of dead wall-clock PER probe, which is
-     * what made the Rubber Ducky demo look wedged at "Loading cviewer scene" --
-     * libxml2 probes /etc/xml/catalog there, and that file is absent by design.
-     * A share-lock/handle-pressure failure (the case this retry exists for)
-     * reports EACCES/EBUSY, not ENOENT, so the recovery still works. */
-    if (!fp && errno != ENOENT &&
-        !(flags & (CELL_FS_O_CREAT | CELL_FS_O_WRONLY | CELL_FS_O_TRUNC))) {
-        for (int _r = 0; !fp && _r < 3000; _r++) {
+    /* Windows share locks and handle pressure can briefly prevent an asset
+     * read. Keep the bounded retry for those failures, without retrying
+     * missing files, directories or any potentially mutating open. */
+    if (read_only) {
+        for (int retry = 0; !fp && retry < 3000; retry++) {
+            if (errno != EACCES && errno != EBUSY && errno != EMFILE && errno != ENFILE)
+                break;
 #ifdef _WIN32
             Sleep(1);
 #else
-            /* The delay is the retry. 3000 iterations is meant to be about
-             * three seconds of waiting for a transient share lock or handle
-             * pressure to clear; without it the loop spends microseconds
-             * calling fopen 3000 times on a condition that has not changed,
-             * and the recovery this exists for never happens. */
-            { struct timespec _d = { 0, 1000 * 1000 }; nanosleep(&_d, NULL); }
+            struct timespec delay = { 0, 1000 * 1000 };
+            nanosleep(&delay, NULL);
 #endif
-            fp = fopen(host_path, mode);
-        }
-        if (fp) fprintf(stderr, "[sys_fs] open recovered after retry: %s\n", host_path);
-    }
-
-    /* If CREAT flag set and file doesn't exist, try creating it */
-    if (!fp && (flags & CELL_FS_O_CREAT)) {
-        fp = fopen(host_path, "w+b");
-    }
-
-    /* A DIRECTORY open is not a failure. fopen() cannot open one on Windows,
-     * but real cellFsOpen answers CELL_EISDIR and titles branch on it -- flOw
-     * opens Data/Titles/ (its localisation XML dir) and a generic ENOENT tells
-     * it the content is missing rather than "that is a directory".
-     * libs/filesystem/cellFs.c and runtime/ppu/ppu_fs.cpp already answer this
-     * correctly; sys_fs is the third filesystem path and never got it. */
-    if (!fp) {
-        struct stat _sd;
-        if (stat(host_path, &_sd) == 0 && (_sd.st_mode & S_IFMT) == S_IFDIR) {
-            fprintf(stderr, "[sys_fs] open -> EISDIR (directory): %s\n", host_path);
-            return (int64_t)(int32_t)CELL_EISDIR;
+            fp = fs_host_open(host_path, flags);
+            if (fp) fprintf(stderr, "[sys_fs] open recovered after retry: %s\n", host_path);
         }
     }
 
     if (!fp) {
-        { struct stat _s2; int _ex = (stat(host_path,&_s2)==0);
-          fprintf(stderr, "[sys_fs] open FAILED: %s [guest '%s' flags=0x%X] (errno=%d %s, exists=%d, size=%lld)\n",
-                  host_path, ps3_path ? ps3_path : "", (unsigned)flags, errno, strerror(errno), _ex, _ex?(long long)_s2.st_size:-1LL); }
-        return (int64_t)(int32_t)CELL_ENOENT;
+        int error = errno;
+        struct stat st;
+        int exists = stat(host_path, &st) == 0;
+        fprintf(stderr, "[sys_fs] open FAILED: %s [guest '%s' flags=0x%X] (errno=%d %s, exists=%d, size=%lld)\n",
+                host_path, ps3_path, (unsigned)flags, error, strerror(error),
+                exists, exists ? (long long)st.st_size : -1LL);
+        return fs_host_open_error(error);
     }
 
     fprintf(stderr, "[sys_fs] open OK: %s\n", host_path);
@@ -687,7 +657,7 @@ int64_t sys_fs_stat(ppu_context* ctx)
 
     const char* ps3_path = (const char*)vm_to_host(path_addr);
     char host_path[1024];
-    sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    translate_path(ps3_path, host_path, sizeof(host_path), 1);
 
     struct stat st;
 #ifdef _WIN32
@@ -754,7 +724,7 @@ int64_t sys_fs_opendir(ppu_context* ctx)
 
     const char* ps3_path = (const char*)vm_to_host(path_addr);
     char host_path[1024];
-    sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    translate_path(ps3_path, host_path, sizeof(host_path), 1);
 
     int slot = -1;
     for (int i = 0; i < SYS_FS_DIR_MAX; i++) {
@@ -898,7 +868,7 @@ int64_t sys_fs_mkdir(ppu_context* ctx)
 
     const char* ps3_path = (const char*)vm_to_host(path_addr);
     char host_path[1024];
-    sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    translate_path(ps3_path, host_path, sizeof(host_path), 0);
 
 #ifdef _WIN32
     int rc = _mkdir(host_path);
@@ -939,8 +909,8 @@ int64_t sys_fs_rename(ppu_context* ctx)
     const char* new_ps3 = (const char*)vm_to_host(new_addr);
 
     char old_host[1024], new_host[1024];
-    sys_fs_translate_path(old_ps3, old_host, sizeof(old_host));
-    sys_fs_translate_path(new_ps3, new_host, sizeof(new_host));
+    translate_path(old_ps3, old_host, sizeof(old_host), 0);
+    translate_path(new_ps3, new_host, sizeof(new_host), 0);
 
     if (rename(old_host, new_host) != 0)
         return (int64_t)(int32_t)CELL_ENOENT;
@@ -962,7 +932,7 @@ int64_t sys_fs_unlink(ppu_context* ctx)
 
     const char* ps3_path = (const char*)vm_to_host(path_addr);
     char host_path[1024];
-    sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    translate_path(ps3_path, host_path, sizeof(host_path), 0);
 
 #ifdef _WIN32
     if (_unlink(host_path) != 0)
@@ -988,7 +958,7 @@ int64_t sys_fs_rmdir(ppu_context* ctx)
 
     const char* ps3_path = (const char*)vm_to_host(path_addr);
     char host_path[1024];
-    sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    translate_path(ps3_path, host_path, sizeof(host_path), 0);
 
 #ifdef _WIN32
     if (_rmdir(host_path) != 0)

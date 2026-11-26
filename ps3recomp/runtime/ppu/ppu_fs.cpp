@@ -17,6 +17,7 @@
 #include "../../libs/filesystem/edat.h"
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
 #include "ps3emu/guest_call.h" /* ps3_invoke_guest: AIO completion is a guest OPD */
+#include "../../libs/filesystem/fs_host_open.h"
 #include "sdata_decrypt.h"   /* SDATA/EDAT (NPD) decryption for cellFsSdataOpen */
 #include "ps3emu/hz_stats.h"   /* v225A hitch attribution: guest file-read time */
 #include <stdint.h>
@@ -53,18 +54,11 @@ extern "C" void     vm_write64(uint64_t a, uint64_t v);
 extern "C" const char* ppu_vfs_root = ".";
 
 /* CELL_FS return / mode / flag constants. */
-#define CELL_OK              0
 #define CELL_FS_ENOENT       (-2147418106)   /* 0x80010006 -- was -2147418090, which is 0x80010016 = CELL_ENOTCONN, not ENOENT */
 #define CELL_FS_EISDIR       (-2147418094)   /* 0x80010012 */
 #define CELL_FS_EIO          (-2147418111)
 #define CELL_FS_S_IFDIR      0x4000u
 #define CELL_FS_S_IFREG      0x8000u
-#define CELL_FS_O_RDONLY     0
-#define CELL_FS_O_WRONLY     1
-#define CELL_FS_O_RDWR       2
-#define CELL_FS_O_CREAT      0x0200
-#define CELL_FS_O_TRUNC      0x0400
-#define CELL_FS_O_APPEND     0x0100
 #define CELL_FS_SEEK_SET     0
 #define CELL_FS_SEEK_CUR     1
 #define CELL_FS_SEEK_END     2
@@ -87,10 +81,11 @@ static void guest_strcpy(char* dst, uint32_t gaddr, size_t cap)
 /* Defined in runtime/syscalls/sys_fs.c -- shared by all three path
  * translators. (extern "C" is ill-formed at block scope.) */
 extern "C" void ps3_vfs_ps3game_fallback(char* path, size_t cap);
+extern "C" void ps3_vfs_hdd0_legacy_read(const char*, char*, size_t, const char*);
 
 /* Translate a guest path to a host path under ppu_vfs_root. Known PS3 mount
  * prefixes are stripped; the rest is appended to the root. */
-static void host_path(char* out, size_t cap, const char* guest)
+static void host_path(char* out, size_t cap, const char* guest, bool read_only = true)
 {
     const char* rel = guest;
     /* /dev_hdd0 overlays the installed game-update dir (a disc title patched to
@@ -103,6 +98,8 @@ static void host_path(char* out, size_t cap, const char* guest)
     if (hdd0_root && strncmp(guest, "/dev_hdd0/", 10) == 0) {
         snprintf(out, cap, "%s/%s", hdd0_root, guest + 10);
         for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
+        if (read_only)
+            ps3_vfs_hdd0_legacy_read(guest, out, cap, ppu_vfs_root);
         return;
     }
 
@@ -189,53 +186,24 @@ static void cellFsOpen(ppu_context* ctx)
     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
     uint32_t flags  = (uint32_t)ctx->gpr[4];
     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
-    host_path(hpath, sizeof hpath, gpath);
+    const bool read_only = fs_read_only(flags);
+    host_path(hpath, sizeof hpath, gpath, read_only);
 
     /* NPDRM: see the note in sys_fs.c -- an EDAT is decrypted once into a cache
      * file and that is opened in its place. */
-    { char dec_path[1200];
-      const char* use = edat_resolve(hpath, dec_path, sizeof dec_path);
-      if (use != hpath) snprintf(hpath, sizeof hpath, "%s", use); }
-
-    /* fopen() mode strings can't express the PS3/POSIX open semantics (e.g.
-     * O_WRONLY without create+truncate, or O_CREAT without O_TRUNC), so build
-     * real open() flags from the access mode (low 2 bits) + the modifiers, then
-     * wrap the fd in a FILE* with fdopen() (which neither creates nor truncates
-     * -- that was already decided by open()). */
-    int acc = flags & 0x3;
-    int oflags = (acc == CELL_FS_O_RDWR)   ? O_RDWR
-               : (acc == CELL_FS_O_WRONLY) ? O_WRONLY : O_RDONLY;
-    if (flags & CELL_FS_O_CREAT)  oflags |= O_CREAT;
-    if (flags & CELL_FS_O_TRUNC)  oflags |= O_TRUNC;
-    if (flags & CELL_FS_O_APPEND) oflags |= O_APPEND;
-
-    /* A bare device root ("/dev_bdvd") resolves to a DIRECTORY, and open() on a
-     * directory fails on Windows. Real cellFsOpen answers EISDIR there, and a
-     * title reads that as "the medium is mounted" -- YDKJ probes the disc this
-     * way before loading its Scaleform UI and FMOD banks, so the ENOENT it got
-     * instead read as "no disc" and it drew nothing but a clear colour.
-     * S_IFMT/S_IFDIR rather than S_ISDIR: MSVC's CRT does not define the macro. */
-    {
-        struct stat _dst;
-        if (stat(hpath, &_dst) == 0 && (_dst.st_mode & S_IFMT) == S_IFDIR) {
-            ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EISDIR;
-            return;
-        }
+    if (read_only) {
+        char dec_path[1200];
+        const char* use = edat_resolve(hpath, dec_path, sizeof dec_path);
+        if (use != hpath) snprintf(hpath, sizeof hpath, "%s", use);
     }
-    int hfd = open(hpath, oflags | O_BINARY, 0666);
-    if (hfd < 0) {
-        fprintf(stderr, "[fs] open FAIL '%s' -> '%s'\n", gpath, hpath);
-        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
-    }
-    const char* fmode = (acc == CELL_FS_O_RDWR)
-                        ? ((flags & CELL_FS_O_APPEND) ? "ab+" : "rb+")
-                        : (acc == CELL_FS_O_WRONLY)
-                          ? ((flags & CELL_FS_O_APPEND) ? "ab" : "wb")
-                          : "rb";
-    FILE* f = fdopen(hfd, fmode);
+
+    FILE* f = fs_host_open(hpath, flags);
     if (!f) {
-        close(hfd);
-        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
+        int error = errno;
+        fprintf(stderr, "[fs] open FAIL '%s' -> '%s' (flags=0x%X, errno=%d %s)\n",
+                gpath, hpath, (unsigned)flags, error, strerror(error));
+        ctx->gpr[3] = (uint64_t)(int64_t)fs_host_open_error(error);
+        return;
     }
     int fd = fd_alloc_file(f);
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
@@ -708,7 +676,7 @@ static void cellFsMkdir(ppu_context* ctx)
 {
     char gpath[1024], hpath[1100];
     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
-    host_path(hpath, sizeof hpath, gpath);
+    host_path(hpath, sizeof hpath, gpath, false);
     int r = host_mkdir_p(hpath);
     if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] mkdir '%s' -> '%s' (%s)\n", gpath, hpath, r == 0 ? "OK" : "FAIL");
     ctx->gpr[3] = CELL_OK;   /* existing dir is benign for boot */

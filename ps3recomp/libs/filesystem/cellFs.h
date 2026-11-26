@@ -10,6 +10,7 @@
 
 #include "ps3emu/ps3types.h"
 #include "ps3emu/error_codes.h"
+#include "fs_open_flags.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -24,17 +25,6 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * Constants
  * -----------------------------------------------------------------------*/
-
-/* File open flags */
-#define CELL_FS_O_RDONLY    000000
-#define CELL_FS_O_WRONLY    000001
-#define CELL_FS_O_RDWR      000002
-#define CELL_FS_O_ACCMODE   000003
-#define CELL_FS_O_CREAT     000100
-#define CELL_FS_O_EXCL      000200
-#define CELL_FS_O_TRUNC     001000
-#define CELL_FS_O_APPEND    002000
-#define CELL_FS_O_MSELF     010000
 
 /* Seek whence */
 #define CELL_FS_SEEK_SET    0

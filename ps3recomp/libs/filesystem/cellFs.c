@@ -6,6 +6,7 @@
  */
 
 #include "cellFs.h"
+#include "fs_host_open.h"
 #include "../../runtime/platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 #include "ps3emu/endian.h"
 #include <stdio.h>
@@ -157,8 +158,11 @@ static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
         return -1;
 
     const char* remainder = ps3_path + best_len;
-    snprintf(host_buf, buf_size, "%s/%s%s", s_root_path,
-             s_path_mappings[best].host_path, remainder);
+    const char* mount = s_path_mappings[best].host_path;
+    if (mount[0] == '/' || mount[0] == '\\' || (mount[0] && mount[1] == ':'))
+        snprintf(host_buf, buf_size, "%s%s", mount, remainder);
+    else
+        snprintf(host_buf, buf_size, "%s/%s%s", s_root_path, mount, remainder);
 
     /* A mapped path with an empty remainder ends in a separator ("…/dev_hdd0/"),
      * and stat() rejects that on Windows -- so the directory a game asks about
@@ -212,7 +216,11 @@ static const char* gpath(const char* guest)
 
 int cellfs_translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
 {
-    return translate_path(ps3_path, host_buf, buf_size);
+    extern void ps3_vfs_hdd0_legacy_read(const char*, char*, size_t, const char*);
+    int result = translate_path(ps3_path, host_buf, buf_size);
+    if (result == 0)
+        ps3_vfs_hdd0_legacy_read(ps3_path, host_buf, buf_size, "gamedata/dev_hdd0");
+    return result;
 }
 
 /* ---------------------------------------------------------------------------
@@ -345,31 +353,6 @@ static CellFsDir alloc_dir(void)
     return -1;
 }
 
-/* Build fopen mode string from PS3 flags */
-static const char* flags_to_mode(s32 flags)
-{
-    int access  = flags & CELL_FS_O_ACCMODE;
-    int create  = flags & CELL_FS_O_CREAT;
-    int trunc   = flags & CELL_FS_O_TRUNC;
-    int append  = flags & CELL_FS_O_APPEND;
-
-    if (access == CELL_FS_O_RDONLY) {
-        return "rb";
-    } else if (access == CELL_FS_O_WRONLY) {
-        if (append)       return "ab";
-        if (create && trunc) return "wb";
-        if (create)       return "wb";
-        if (trunc)        return "wb";
-        return "r+b";  /* write-only to existing file */
-    } else { /* RDWR */
-        if (append)       return "a+b";
-        if (create && trunc) return "w+b";
-        if (create)       return "a+b";  /* create if needed, don't truncate */
-        if (trunc)        return "w+b";
-        return "r+b";
-    }
-}
-
 /* Recursively create directories for a path (like mkdir -p) */
 static void ensure_parent_dirs(const char* path)
 {
@@ -414,7 +397,10 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
         return CELL_EFAULT;
 
     char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
-    if (translate_path(gpath(path), host_path, sizeof(host_path)) != 0) {
+    int translated = fs_read_only(flags)
+        ? cellfs_translate_path(gpath(path), host_path, sizeof(host_path))
+        : translate_path(gpath(path), host_path, sizeof(host_path));
+    if (translated != 0) {
         /* gpath(), not the raw parameter: `path` is a GUEST address, and
          * printing it as a host string faults. The failure path was
          * crashing the moment any lookup missed. */
@@ -427,19 +413,12 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
         ensure_parent_dirs(host_path);
     }
 
-    const char* mode = flags_to_mode(flags);
-    FILE* fp = fopen(host_path, mode);
-
-    /* If open for read failed and CREAT is set, try creating */
-    if (!fp && (flags & CELL_FS_O_CREAT)) {
-        fp = fopen(host_path, "w+b");
-    }
-
+    FILE* fp = fs_host_open(host_path, (uint32_t)flags);
     if (!fp) {
-        printf("[cellFs] Open: fopen('%s', '%s') failed: %s\n", host_path, mode, strerror(errno));
-        if (errno == ENOENT) return (s32)CELL_ENOENT;
-        if (errno == EACCES) return (s32)CELL_EPERM;
-        return (s32)CELL_ENOENT;
+        int error = errno;
+        printf("[cellFs] Open: host open('%s', 0x%X) failed: %s\n",
+               host_path, (unsigned)flags, strerror(error));
+        return fs_host_open_error(error);
     }
 
     CellFsFd slot = alloc_fd();
@@ -620,7 +599,7 @@ s32 cellFsStat(const char* path, CellFsStat* sb)
         return CELL_EFAULT;
 
     char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
-    if (translate_path(gpath(path), host_path, sizeof(host_path)) != 0)
+    if (cellfs_translate_path(gpath(path), host_path, sizeof(host_path)) != 0)
         return (s32)CELL_ENOENT;
 
     HOST_STAT_T hst;
@@ -765,7 +744,7 @@ s32 cellFsOpendir(const char* path, CellFsDir* fd)
         return CELL_EFAULT;
 
     char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
-    if (translate_path(gpath(path), host_path, sizeof(host_path)) != 0)
+    if (cellfs_translate_path(gpath(path), host_path, sizeof(host_path)) != 0)
         return (s32)CELL_ENOENT;
 
     CellFsDir slot = alloc_dir();
