@@ -52,7 +52,8 @@ The installer runs these steps:
 9. It writes `Play inFamous.cmd`.
 
 Finished steps are skipped when you run the installer again, so an interrupted install continues
-where it stopped. `--regen` starts the pipeline over.
+where it stopped. If reused generated files do not match the current patch set, the installer
+reruns generation once before patching. `--regen` starts the pipeline over immediately.
 
 ### Updating an installation
 

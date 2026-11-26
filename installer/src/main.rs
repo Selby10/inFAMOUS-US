@@ -461,29 +461,18 @@ fn cmd_install(s: &Session) -> Result<()> {
         } else {
             Vec::new()
         };
-        util::heading("Regenerating the game code from your files");
-        let failed = pipeline::run_steps(&s.m, &s.root, &vars, &sha, s.o.regen)?;
-        if !failed.is_empty() {
-            util::warn(&format!(
-                "optional steps failed: {} (the matching features stay off)",
-                failed.join(", ")
-            ));
-        }
-
-        util::heading("Applying the port's patches");
-        let tolerate: Vec<String> =
-            s.m.steps
-                .iter()
-                .filter(|st| failed.contains(&st.id))
-                .flat_map(|st| st.outputs.clone())
-                .collect();
-        pipeline::apply_lock(
+        pipeline::generate_and_apply_patches(
             &s.m,
             &s.root,
-            &s.installer_dir,
-            region.as_deref(),
-            &lock,
-            &tolerate,
+            &vars,
+            &sha,
+            pipeline::PatchSet {
+                lock: &lock,
+                title_id: g.title_id(),
+                installer_dir: &s.installer_dir,
+                region: region.as_deref(),
+            },
+            s.o.regen,
         )?;
         let state_path = s.root.join(".installer").join("state");
         let mut st = lock::State::load(&state_path);
@@ -1078,7 +1067,7 @@ fn cmd_make_patches(s: &Session) -> Result<()> {
     vars.set("jobs", s.jobs().to_string());
 
     util::heading("Running the pipeline on the clean tree");
-    let failed = pipeline::run_steps(&s.m, &fresh, &vars, &sha, s.o.regen)?;
+    let failed = pipeline::run_steps(&s.m, &fresh, &vars, &sha, s.o.regen)?.failed_optional;
     if !failed.is_empty() {
         util::warn(&format!("optional steps failed: {}", failed.join(", ")));
     }

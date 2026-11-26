@@ -198,15 +198,20 @@ fn run_one(step: &Step, vars: &Vars, root: &Path) -> Result<()> {
     util::run(&mut cmd)
 }
 
+pub struct StepRun {
+    pub failed_optional: Vec<String>,
+    reused_cached: bool,
+}
+
 /// Run the manifest's steps in `root`. Steps already done for this EBOOT are skipped until one
-/// has to run; from then on everything after it runs too. Returns the optional steps that failed.
+/// has to run; from then on everything after it runs too.
 pub fn run_steps(
     m: &Manifest,
     root: &Path,
     vars: &Vars,
     eboot_sha: &str,
     regen: bool,
-) -> Result<Vec<String>> {
+) -> Result<StepRun> {
     let state_path = root.join(".installer").join("state");
     let mut st = State::load(&state_path);
     if regen || st.eboot.as_deref() != Some(eboot_sha) {
@@ -219,10 +224,12 @@ pub fn run_steps(
     fs::create_dir_all(root.join(".installer").join("work"))?;
     let mut failed = Vec::new();
     let mut rerun_rest = false;
+    let mut reused_cached = false;
     let n = m.steps.len();
     for (i, step) in m.steps.iter().enumerate() {
         if !rerun_rest && st.done.contains(&step.id) {
             util::info(&format!("[{}/{n}] {} (already done)", i + 1, step.title));
+            reused_cached = true;
             continue;
         }
         rerun_rest = true;
@@ -266,7 +273,10 @@ pub fn run_steps(
             Err(e) => bail!("step '{}' failed: {e}", step.id),
         }
     }
-    Ok(failed)
+    Ok(StepRun {
+        failed_optional: failed,
+        reused_cached,
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -296,74 +306,161 @@ pub fn patch_path(installer_dir: &Path, rel: &str) -> PathBuf {
     util::join_slash(&installer_dir.join("patches"), &format!("{rel}.patch"))
 }
 
-/// `tolerate`: globs of outputs of optional steps that failed; those files may be missing.
-pub fn apply_lock(
+pub struct PatchSet<'a> {
+    pub lock: &'a Lock,
+    pub title_id: &'a str,
+    pub installer_dir: &'a Path,
+    pub region: Option<&'a Path>,
+}
+
+/// Generate and patch the sources, regenerating once if a reused generation step left a stale
+/// patch input. An explicit full regeneration and ordinary I/O or patch errors fail directly.
+pub fn generate_and_apply_patches(
     m: &Manifest,
     root: &Path,
-    installer_dir: &Path,
-    region: Option<&Path>,
-    lock: &Lock,
-    tolerate: &[String],
+    vars: &Vars,
+    eboot_sha: &str,
+    patches: PatchSet<'_>,
+    mut regen: bool,
 ) -> Result<()> {
+    let title_id = patches.title_id;
+    loop {
+        util::heading("Regenerating the game code from your files");
+        let steps = run_steps(m, root, vars, eboot_sha, regen)?;
+        if !steps.failed_optional.is_empty() {
+            util::warn(&format!(
+                "optional steps failed: {} (the matching features stay off)",
+                steps.failed_optional.join(", ")
+            ));
+        }
+        let tolerate: Vec<String> = m
+            .steps
+            .iter()
+            .filter(|st| steps.failed_optional.contains(&st.id))
+            .flat_map(|st| st.outputs.clone())
+            .collect();
+        util::heading("Applying the port's patches");
+        let problems = apply_lock(m, root, &patches, &tolerate)?;
+        if problems.is_empty() {
+            return Ok(());
+        }
+        if regen || !steps.reused_cached {
+            bail!(
+                "{} generated file(s) for {title_id} do not match the port's patch inputs:\n      {}{}",
+                problems.len(),
+                problems.iter().take(25).map(String::as_str).collect::<Vec<_>>().join("\n      "),
+                if problems.len() > 25 { "\n      ..." } else { "" }
+            );
+        }
+        util::warn(&format!(
+            "Cached generated files for {title_id} do not match the port's current patch set. Rerunning all generation steps once.\n    {}",
+            problems[0]
+        ));
+        regen = true;
+    }
+}
+
+enum PatchAction<'a> {
+    Remove(PathBuf),
+    Apply {
+        path: PathBuf,
+        entry: &'a Entry,
+        final_hash: &'a str,
+    },
+}
+
+/// Return any mismatched inputs before touching the tree. Missing outputs from failed optional
+/// steps are tolerated, and files that already match their final hashes need no patch.
+fn apply_lock(
+    m: &Manifest,
+    root: &Path,
+    patches: &PatchSet<'_>,
+    tolerate: &[String],
+) -> Result<Vec<String>> {
     let present: BTreeSet<String> =
         util::select_files(root, &m.gen_include, &m.gen_exclude, SKIP_DIRS)?
             .into_iter()
             .collect();
-    let known: BTreeSet<&str> = lock.files.iter().map(|e| e.path.as_str()).collect();
-    let mut problems: Vec<String> = Vec::new();
+    let known: BTreeSet<&str> = patches.lock.files.iter().map(|e| e.path.as_str()).collect();
+    let mut problems = Vec::new();
+    let mut actions = Vec::new();
     let (mut patched, mut created, mut removed, mut same) = (0, 0, 0, 0);
-    for e in &lock.files {
+    for e in &patches.lock.files {
         let p = util::join_slash(root, &e.path);
-        let cur = if p.is_file() {
-            Some(hash::sha256_file(&p)?)
+        let exists = match fs::metadata(&p) {
+            Ok(md) if md.is_file() => true,
+            Ok(_) if e.fin.is_none() => false,
+            Ok(_) => bail!("{} is not a regular file", p.display()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) => bail!("reading metadata for {}: {err}", p.display()),
+        };
+        let Some(fin) = &e.fin else {
+            if exists {
+                actions.push(PatchAction::Remove(p));
+            }
+            continue;
+        };
+        let cur = if exists {
+            Some(hash::sha256_file(&p).ctx(|| format!("hashing {}", p.display()))?)
         } else {
             None
         };
-        match (&e.base, &e.fin) {
-            (_, None) => {
-                if cur.is_some() {
-                    fs::remove_file(&p).ctx(|| format!("removing {}", p.display()))?;
-                    removed += 1;
-                }
+        if cur.as_ref() == Some(fin) {
+            same += 1;
+        } else if cur.is_none() && e.base.is_some() && util::any_match(tolerate, &e.path) {
+            util::warn(&format!("skipping {} (its optional step failed)", e.path));
+        } else if cur == e.base {
+            actions.push(PatchAction::Apply {
+                path: p,
+                entry: e,
+                final_hash: fin,
+            });
+        } else {
+            problems.push(format!(
+                "{} (expected base SHA-256 {}, final SHA-256 {fin}; actual {})",
+                e.path,
+                e.base.as_deref().unwrap_or("absent"),
+                cur.as_deref().unwrap_or("missing"),
+            ));
+        }
+    }
+    if !problems.is_empty() {
+        return Ok(problems);
+    }
+
+    for action in actions {
+        match action {
+            PatchAction::Remove(p) => {
+                fs::remove_file(&p).ctx(|| format!("removing {}", p.display()))?;
+                removed += 1;
             }
-            (base, Some(fin)) => {
-                if cur.as_deref() == Some(fin.as_str()) {
-                    same += 1;
-                    continue; // already final (identical output, or patched earlier)
-                }
-                if cur.is_none() && base.is_some() && util::any_match(tolerate, &e.path) {
-                    util::warn(&format!("skipping {} (its optional step failed)", e.path));
-                    continue;
-                }
-                if cur != *base {
-                    problems.push(match (&cur, base) {
-                        (None, _) => format!("missing      {}", e.path),
-                        (Some(_), None) => format!("unexpected   {}", e.path),
-                        (Some(_), Some(_)) => format!("differs      {}", e.path),
-                    });
-                    continue;
-                }
-                let old = if base.is_some() {
+            PatchAction::Apply {
+                path: p,
+                entry: e,
+                final_hash,
+            } => {
+                let old = if e.base.is_some() {
                     fs::read(&p)?
                 } else {
                     Vec::new()
                 };
                 // A release's own patch, or else the patch every release shares.
-                let pp = region
+                let pp = patches
+                    .region
                     .map(|d| patch_path(d, &e.path))
                     .filter(|p| p.is_file())
-                    .unwrap_or_else(|| patch_path(installer_dir, &e.path));
+                    .unwrap_or_else(|| patch_path(patches.installer_dir, &e.path));
                 let patch = fs::read(&pp).ctx(|| format!("reading {}", pp.display()))?;
                 let new = diff::apply_patch(&old, &patch)
                     .map_err(|x| util::Error(format!("{}: {x}", pp.display())))?;
-                if hash::sha256_hex(&new) != *fin {
+                if hash::sha256_hex(&new) != final_hash {
                     bail!(
                         "{} applied but the result has the wrong hash -- the patch set is damaged",
                         pp.display()
                     );
                 }
                 util::write_file(&p, &new)?;
-                if base.is_some() {
+                if e.base.is_some() {
                     patched += 1
                 } else {
                     created += 1
@@ -378,17 +475,6 @@ pub fn apply_lock(
     for x in &extra {
         let _ = fs::remove_file(util::join_slash(root, x));
     }
-    if !problems.is_empty() {
-        let shown: Vec<String> = problems.iter().take(25).cloned().collect();
-        bail!(
-            "{} generated file(s) do not match what the port's patches were made from:\n      {}{}\n\n    \
-             This usually means a different game version/region, or different Python package versions\n    \
-             (delete the .installer folder and run again to start clean).",
-            problems.len(),
-            shown.join("\n      "),
-            if problems.len() > 25 { "\n      ..." } else { "" }
-        );
-    }
     util::info(&format!(
         "{same} file(s) already right, {patched} patched, {created} created, {removed} removed{}",
         if extra.is_empty() {
@@ -397,7 +483,7 @@ pub fn apply_lock(
             format!(", {} stray removed", extra.len())
         }
     ));
-    Ok(())
+    Ok(problems)
 }
 
 // ---------------------------------------------------------------------------------------------
