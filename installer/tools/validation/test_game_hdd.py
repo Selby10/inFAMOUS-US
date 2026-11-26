@@ -1,4 +1,4 @@
-"""Run from a VS x64 Developer Command Prompt with clang-cl on PATH."""
+"""Run from a VS x64 Developer Command Prompt with clang-cl and LLD on PATH."""
 import os
 from pathlib import Path
 import shutil
@@ -12,24 +12,28 @@ SDK = ROOT / 'ps3recomp'
 
 class GameHddTests(unittest.TestCase):
     def test_native_mount_and_guest_open_handlers(self):
-        compiler = shutil.which('clang-cl')
-        if not compiler or not shutil.which('link'):
+        clang = shutil.which('clang-cl')
+        msvc = shutil.which('cl')
+        if not clang or not msvc or not shutil.which('link'):
             self.skipTest('VS x64 environment with clang-cl required')
         with tempfile.TemporaryDirectory() as temporary:
             temp = Path(temporary)
             # The game-specific generated header provides this same context ABI.
             (temp / 'ppu_recomp.h').write_text('#include "ppu_context.h"\n')
-            common = [compiler, '/nologo', '/O1', '/Gy', '/Gw', '/MD',
-                      '/clang:-Wno-comment', '/clang:-Wno-deprecated-declarations',
-                      '/clang:-Wno-deprecated-volatile',
+            common = ['/nologo', '/O1', '/Gy', '/Gw', '/MD',
                       '/D_CRT_SECURE_NO_WARNINGS', '/I' + str(ROOT),
                       '/I' + str(SDK / 'include'), '/I' + str(SDK / 'runtime/ppu'),
                       '/I' + str(temp)]
             for source in [SDK / 'runtime/syscalls/sys_fs.c', SDK / 'libs/filesystem/cellFs.c']:
-                subprocess.run([*common, '/std:c17', '/c', str(source)], cwd=temp, check=True)
+                subprocess.run([clang, *common, '/clang:-Wno-comment', '/std:c17', '/c',
+                                str(source)], cwd=temp, check=True)
             fixture = Path(__file__).with_name('game_hdd_fixture.cpp')
-            subprocess.run([*common, '-fuse-ld=lld', '/std:c++20', '/EHsc', str(fixture), 'sys_fs.obj',
-                            'cellFs.obj', '/link', '/opt:ref'], cwd=temp, check=True)
+            # Use the compiler shipped with the runner's MSVC STL for the C++ fixture.
+            subprocess.run([msvc, *common, '/std:c++20', '/EHsc', '/c', str(fixture)],
+                           cwd=temp, check=True)
+            subprocess.run([clang, '/nologo', '/MD', '-fuse-ld=lld', '/Fe:game_hdd_fixture.exe',
+                            'game_hdd_fixture.obj', 'sys_fs.obj', 'cellFs.obj', '/link', '/opt:ref'],
+                           cwd=temp, check=True)
             for scenario, title in [('fresh', 'BCUS98119'), ('legacy', 'BCUS98119'),
                                     ('split', 'BCUS98119'),
                                     ('explicit', 'BCES00220')]:
