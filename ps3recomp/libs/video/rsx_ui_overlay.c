@@ -1106,28 +1106,181 @@ static void tr_hud_build(void)
     text_draw(s_tr_hud, len, x0 + 12.0f, y0 + 14.0f - sz * 0.62f, sz, fg);
 }
 static void uiov_draw_list(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv, unsigned bbw, unsigned bbh);
-/* v212 F1 FPS counter: frames this overlay was drawn for (= presented guest frames), averaged over 0.5 s, top-left. */
+/* PERF OVERLAY v3: F1 cycles off -> FPS/FG FPS -> detailed. PERF_OVERLAY=1|2 starts it on.
+ * Native FPS and frame-time samples come from successful game-owned Present calls.
+ * FG/output rates come from the validated AMD-wrapped swap-chain present counter. */
 volatile int g_uiov_show_fps = 0;
-static double s_fps_val = 0.0;
+volatile unsigned long long g_ui_vram_mb[2] = { 0, 0 };
+
+#define PF_RING 600
+#define PF_BARS 120
+
+static double s_fps_val = 0.0, s_fg_fps_val = 0.0, s_output_fps_val = 0.0;
+static int s_fg_metrics_valid = 0;
+static double s_pf_max = 0.0, s_pf_low1 = 0.0;
+static float s_pf_ring[PF_RING];
+static unsigned s_pf_n = 0, s_pf_i = 0;
+
+/* Called after each successful native Present; generated frames never enter this ring. */
+void uiov_perf_record_native_frame(double frame_time_ms)
+{
+    if (frame_time_ms > 0.0 && frame_time_ms < 2000.0) {
+        s_pf_ring[s_pf_i] = (float)frame_time_ms;
+        s_pf_i = (s_pf_i + 1) % PF_RING;
+        if (s_pf_n < PF_RING) s_pf_n++;
+    }
+}
+
+/* Rates are sampled once per second from the native-present total and AMD proxy counter. */
+void uiov_perf_update_rates(double native_fps, double fg_fps, double output_fps, int fg_valid)
+{
+    s_fps_val = native_fps;
+    s_fg_fps_val = fg_fps;
+    s_output_fps_val = output_fps;
+    s_fg_metrics_valid = fg_valid != 0;
+}
+
+static int s_pf_cmp(const void* a, const void* b)
+{
+    const float x = *(const float*)a, y = *(const float*)b;
+    return (x < y) ? -1 : (x > y) ? 1 : 0;
+}
+
 static void fps_tick(void)
 {
-    static LARGE_INTEGER f, t0; static unsigned n = 0;
-    LARGE_INTEGER t; QueryPerformanceCounter(&t);
-    if (!f.QuadPart) { QueryPerformanceFrequency(&f); t0 = t; }
-    n++;
-    const double dt = (double)(t.QuadPart - t0.QuadPart) / (double)f.QuadPart;
-    if (dt >= 0.5) { s_fps_val = n / dt; n = 0; t0 = t; }
+    static LARGE_INTEGER freq, last_stats;
+    static int init = 0;
+    LARGE_INTEGER now;
+
+    if (!init) {
+        const char* e = getenv("PERF_OVERLAY");
+        if (e && *e >= '0' && *e <= '2')
+            g_uiov_show_fps = *e - '0';
+        if (QueryPerformanceFrequency(&freq) && freq.QuadPart > 0 && QueryPerformanceCounter(&now))
+            last_stats = now;
+        init = 1;
+        return;
+    }
+
+    if (!freq.QuadPart || !QueryPerformanceCounter(&now)) return;
+    if (!last_stats.QuadPart || now.QuadPart <= last_stats.QuadPart ||
+        (double)(now.QuadPart - last_stats.QuadPart) < (double)freq.QuadPart * 0.5)
+        return;
+    last_stats = now;
+
+    /* Use the slowest 1% of recent native frame times, not the fastest 1%. */
+    if (s_pf_n) {
+        float tmp[PF_RING];
+        double mx = 0.0, slow_sum = 0.0;
+        unsigned i, k;
+
+        for (i = 0; i < s_pf_n; i++) {
+            tmp[i] = s_pf_ring[i];
+            if (tmp[i] > mx) mx = tmp[i];
+        }
+        s_pf_max = mx;
+
+        if (s_pf_n >= 100) {
+            qsort(tmp, s_pf_n, sizeof tmp[0], s_pf_cmp);
+            k = (s_pf_n + 99u) / 100u;
+            if (k < 1) k = 1;
+            for (i = s_pf_n - k; i < s_pf_n; i++) slow_sum += tmp[i];
+            s_pf_low1 = 1000.0 / (slow_sum / k);
+        }
+    }
 }
+
 static void fps_build(void)
 {
-    if (!g_uiov_show_fps) return;
-    char t[32]; snprintf(t, sizeof t, "%.0f FPS", s_fps_val);
-    const float sz = 26.0f, w = text_width(t, (int)strlen(t), sz);
-    float bg[4], fg[4];
-    rgba(bg, 0, 0, 0, 0.55f); rect(16.0f, 16.0f, 16.0f + w + 24.0f, 16.0f + 40.0f, bg, bg, 0);
-    if (s_fps_val >= 58.0) rgba(fg, 0.55f, 1.0f, 0.55f, 1); else if (s_fps_val >= 45.0) rgba(fg, 1.0f, 0.9f, 0.4f, 1); else rgba(fg, 1.0f, 0.5f, 0.45f, 1);
-    text_draw(t, (int)strlen(t), 28.0f, 16.0f + 20.0f - sz * 0.62f, sz, fg);
+    const int mode = g_uiov_show_fps;
+    const float scale = 1.0f;
+    char ln[4][96];
+    float lsz[4], lh[4], lc[4][4];
+    int nl = 0, i, graph;
+    float w = 0.0f, hsum = 0.0f, gh, y;
+    const float x0 = 16.0f, y0 = 16.0f;
+    float bg[4], gc[4];
+
+    if (mode <= 0) return;
+
+    if (s_fg_metrics_valid)
+        snprintf(ln[nl], sizeof ln[nl], "FPS %.0f   FG FPS %.0f", s_fps_val, s_fg_fps_val);
+    else
+        snprintf(ln[nl], sizeof ln[nl], "FPS %.0f", s_fps_val);
+    lsz[nl] = 26.0f;
+    lh[nl] = 40.0f;
+    if (s_fps_val >= 58.0) rgba(lc[nl], 0.55f, 1.0f, 0.55f, 1);
+    else if (s_fps_val >= 45.0) rgba(lc[nl], 1.0f, 0.9f, 0.4f, 1);
+    else rgba(lc[nl], 1.0f, 0.5f, 0.45f, 1);
+    nl++;
+
+    /* Detailed mode (F1's third position) deliberately contains every metric. */
+    if (mode >= 2) {
+        const double frame_ms = s_fps_val > 0.0 ? 1000.0 / s_fps_val : 0.0;
+        snprintf(ln[nl], sizeof ln[nl], "OUTPUT %.0f FPS   FRAME %.2f ms", s_output_fps_val, frame_ms);
+        lsz[nl] = 18.0f; lh[nl] = 27.0f;
+        rgba(lc[nl], 0.92f, 0.94f, 0.98f, 1.0f); nl++;
+
+        if (s_pf_n >= 100)
+            snprintf(ln[nl], sizeof ln[nl], "1%% LOW %.0f FPS   WORST %.1f ms", s_pf_low1, s_pf_max);
+        else
+            snprintf(ln[nl], sizeof ln[nl], "1%% LOW --   WORST %.1f ms", s_pf_max);
+        lsz[nl] = 18.0f; lh[nl] = 27.0f;
+        if (s_pf_low1 >= 50.0) rgba(lc[nl], 0.85f, 0.95f, 0.85f, 1);
+        else if (s_pf_low1 >= 30.0) rgba(lc[nl], 1.0f, 0.9f, 0.4f, 1);
+        else rgba(lc[nl], 1.0f, 0.72f, 0.62f, 1);
+        nl++;
+
+        if (g_ui_vram_mb[1]) {
+            const unsigned long long vu = g_ui_vram_mb[0];
+            const unsigned long long vb = g_ui_vram_mb[1];
+            snprintf(ln[nl], sizeof ln[nl], "VRAM %llu / %llu MB", vu, vb);
+            if (vu * 10ULL >= vb * 9ULL) rgba(lc[nl], 1.0f, 0.5f, 0.45f, 1);
+            else rgba(lc[nl], 0.7f, 0.85f, 1.0f, 1);
+        } else {
+            snprintf(ln[nl], sizeof ln[nl], "VRAM --");
+            rgba(lc[nl], 0.8f, 0.85f, 0.9f, 1);
+        }
+        lsz[nl] = 18.0f; lh[nl] = 27.0f; nl++;
+    }
+
+    for (i = 0; i < nl; i++) {
+        const float lw = text_width(ln[i], (int)strlen(ln[i]), lsz[i] * scale);
+        if (lw > w) w = lw;
+        hsum += lh[i] * scale;
+    }
+
+    graph = (mode >= 2 && s_pf_n >= PF_BARS);
+    gh = graph ? 46.0f * scale : 0.0f;
+    if (graph && w < PF_BARS * 1.5f * scale) w = PF_BARS * 1.5f * scale;
+
+    rgba(bg, 0, 0, 0, 0.55f);
+    rect(x0, y0, x0 + w + 24.0f * scale,
+         y0 + hsum + gh + (graph ? 6.0f * scale : 0.0f), bg, bg, 0);
+
+    y = y0;
+    for (i = 0; i < nl; i++) {
+        text_draw(ln[i], (int)strlen(ln[i]), x0 + 12.0f * scale,
+                  y + lh[i] * scale * 0.5f - lsz[i] * scale * 0.62f,
+                  lsz[i] * scale, lc[i]);
+        y += lh[i] * scale;
+    }
+
+    if (graph) {
+        const float base = y + gh, bw = 1.2f * scale;
+        for (i = 0; i < PF_BARS; i++) {
+            const float ms = s_pf_ring[(s_pf_i + PF_RING - PF_BARS + (unsigned)i) % PF_RING];
+            const float cl = ms > 50.0f ? 50.0f : ms;
+            const float bh = 2.0f * scale + cl * (gh - 6.0f * scale) / 50.0f;
+            if (ms <= 18.5f) rgba(gc, 0.45f, 0.95f, 0.45f, 0.9f);
+            else if (ms <= 33.4f) rgba(gc, 1.0f, 0.88f, 0.35f, 0.9f);
+            else rgba(gc, 1.0f, 0.45f, 0.4f, 0.95f);
+            rect(x0 + 12.0f * scale + i * 1.5f * scale, base - bh,
+                 x0 + 12.0f * scale + i * 1.5f * scale + bw, base, gc, gc, 0);
+        }
+    }
 }
+
 static void uiov_draw_list(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv, unsigned bbw, unsigned bbh);
 static SceNpTrophyNotice s_trophy_notice;
 static ULONGLONG s_trophy_notice_until;
