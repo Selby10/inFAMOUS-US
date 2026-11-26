@@ -1625,7 +1625,24 @@ static int init_d3d12(u32 width, u32 height)
         factory, (IUnknown*)s_d3d.cmd_queue,
         s_d3d.hwnd, &sc_desc, NULL, NULL, &swap_chain1);
     if (FAILED(hr)) {
-        printf("[D3D12] ERROR: CreateSwapChainForHwnd failed (0x%08lX)\n", hr);
+        const HRESULT removed = s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device);
+        fprintf(stderr, "[D3D12] ERROR: CreateSwapChainForHwnd failed (0x%08lX), "
+                        "output %ux%u, render %ux%u, buffers %u, flags 0x%X, "
+                        "device removal status 0x%08lX\n",
+                (unsigned long)hr, sc_desc.Width, sc_desc.Height, RBW, RBH,
+                sc_desc.BufferCount, sc_desc.Flags, (unsigned long)removed);
+        RECT client;
+        if (GetClientRect(s_d3d.hwnd, &client)) {
+            fprintf(stderr, "[D3D12] Swap-chain window client size: %ldx%ld\n",
+                    client.right - client.left, client.bottom - client.top);
+        }
+        DXGI_QUERY_VIDEO_MEMORY_INFO memory;
+        if (s_adapter3 && SUCCEEDED(s_adapter3->lpVtbl->QueryVideoMemoryInfo(
+                s_adapter3, 0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memory))) {
+            fprintf(stderr, "[D3D12] Local video memory: %llu MiB used / %llu MiB budget\n",
+                    (unsigned long long)(memory.CurrentUsage >> 20),
+                    (unsigned long long)(memory.Budget >> 20));
+        }
         factory->lpVtbl->Release(factory);
         return -1;
     }

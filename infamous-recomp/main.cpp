@@ -154,6 +154,7 @@ extern "C" int  rsx_null_backend_pump_messages(void);
 #define STACK_TOP     0x0FF00000u      /* main-thread stack, below the 0x10000000 segment */
 #define WINDOW_WIDTH  1280
 #define WINDOW_HEIGHT 720
+static constexpr int GRAPHICS_STARTUP_EXIT_CODE = 4;
 
 /* ---------------------------------------------------------------------------
  * Frame clock
@@ -205,7 +206,19 @@ static DWORD WINAPI frame_clock(LPVOID)
     const char* title = getenv("PS3_TITLE");
     if (!title || !*title) title = "inFamous (" INF_RELEASE_NAME ")";
 
-    int rsx_ok = (rsx_backend_init(WINDOW_WIDTH, WINDOW_HEIGHT, title) == 0);
+    const int init_result = rsx_backend_init(WINDOW_WIDTH, WINDOW_HEIGHT, title);
+#ifdef _WIN32
+    if (init_result != 0) {
+        fprintf(stderr, "[rsx] %s backend init FAILED (result %d), exiting with status %d\n",
+                RSX_BACKEND_NAME, init_result, GRAPHICS_STARTUP_EXIT_CODE);
+        /* The guest can already be running and waiting for the FIFO. As on
+         * window close, stop all threads without running static destructors. */
+        fflush(NULL);
+        TerminateProcess(GetCurrentProcess(), GRAPHICS_STARTUP_EXIT_CODE);
+        _Exit(GRAPHICS_STARTUP_EXIT_CODE);
+    }
+#endif
+    int rsx_ok = (init_result == 0);
     fprintf(stderr, "[rsx] %s backend init %s\n", RSX_BACKEND_NAME,
             rsx_ok ? "OK -- window open" : "FAILED");
 
@@ -1062,7 +1075,15 @@ int main(int argc, char** argv)
     /* Install the guest-callback hook, then start the frame clock. It no-ops
      * until the title registers its vblank and flip handlers during init. */
     g_ps3_guest_caller = harness_guest_caller;
-    CreateThread(NULL, 4u * 1024 * 1024, frame_clock, NULL, 0, NULL);
+    HANDLE frame_thread = CreateThread(NULL, 4u * 1024 * 1024, frame_clock, NULL, 0, NULL);
+    if (!frame_thread) {
+        const DWORD error = GetLastError();
+        fprintf(stderr, "[rsx] Could not start %s frame clock (error %lu), exiting with status %d\n",
+                RSX_BACKEND_NAME, (unsigned long)error, GRAPHICS_STARTUP_EXIT_CODE);
+        fflush(NULL);
+        return GRAPHICS_STARTUP_EXIT_CODE;
+    }
+    CloseHandle(frame_thread);
 
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n",
            entry, STACK_TOP);
